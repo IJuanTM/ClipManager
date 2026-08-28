@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 
 # -------------------- toast popup (runs as a separate process) --------------------
-# Per-pixel alpha via Win32 UpdateLayeredWindow, not tkinter chroma-key, for real anti-aliasing and a soft shadow without a fringe. Requires Pillow in OBS's configured Python: pythonw.exe -m pip install pillow
+# Per-pixel alpha via Win32 UpdateLayeredWindow, not tkinter chroma-key, so the shadow can fade out without a fringe.
 TOASTS = {
     "replay_saved": {"icon": "success", "self_contained": True, "text": "Replay saved"},
     "replay_failed": {
@@ -122,14 +122,12 @@ SELF_CONTAINED_ICON_SCALE = 2.0
 GLYPH_ICON_SCALE = 1.1
 # Only the "on" (slash-free) variant's bbox is trustworthy for measuring an off-center glyph - the "off" variant's bbox is dominated by its symmetric diagonal slash regardless of where the glyph sits.
 ICON_Y_OFFSET_SRC_PX = {"display-capture-on": 12.5, "display-capture-off": 12.5}
-ICON_Y_NUDGE_PX = (
-    1  # applies to every icon, not just the ones with a measured offset above
-)
+ICON_Y_NUDGE_PX = 1  # applies to every icon, not just the ones with a measured offset above
 TOAST_HOLD_SECONDS = 2.0
 TOAST_MAX_SLOTS = 8
 STATE_POLL_SECONDS = 0.1
 TOAST_MUTEX_NAME = "Local\\ClipManagerToastStateMutex"
-SCRIPT_VERSION = "0.4.5"
+SCRIPT_VERSION = "0.4.6"
 
 FONT_CANDIDATES = [
     r"C:\Windows\Fonts\segoeuib.ttf",
@@ -362,7 +360,7 @@ if __name__ == "__main__":
     HWND_TOPMOST = wintypes.HWND(-1)
     SW_SHOWNA = 8
 
-    # Explicit argtypes throughout - ctypes' default marshalling can silently truncate pointer-sized values on 64-bit Windows, a nastier failure mode than a clean exception.
+    # Explicit argtypes throughout - ctypes' default marshalling silently truncates pointer-sized values on 64-bit Windows.
     user32.CreateWindowExW.argtypes = [
         wintypes.DWORD,
         wintypes.LPCWSTR,
@@ -478,9 +476,7 @@ if __name__ == "__main__":
         bmi = BITMAPINFO()
         bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
         bmi.bmiHeader.biWidth = img.width
-        bmi.bmiHeader.biHeight = (
-            -img.height
-        )  # negative = top-down, matches PIL row order
+        bmi.bmiHeader.biHeight = -img.height  # negative = top-down, matches PIL's row order
         bmi.bmiHeader.biPlanes = 1
         bmi.bmiHeader.biBitCount = 32
         bmi.bmiHeader.biCompression = BI_RGB
@@ -563,7 +559,7 @@ if __name__ == "__main__":
         return 1 - (1 - t) ** 3
 
     def animate_slide(
-        hwnd, x_from, x_to, y, w, h, screen_w, screen_h, duration=0.18, steps=24
+        hwnd, x_from, x_to, y, w, h, screen_w, screen_h, duration=0.15, steps=24
     ):
         for i in range(steps + 1):
             t = ease_out_cubic(i / steps)
@@ -610,7 +606,7 @@ if __name__ == "__main__":
         # `or` would wrongly discard an explicit 0ms (instant slide), which the UI allows.
         slide_in_ms = cfg.get("slide_in_ms")
         slide_out_ms = cfg.get("slide_out_ms")
-        slide_in_s = (180 if slide_in_ms is None else slide_in_ms) / 1000
+        slide_in_s = (150 if slide_in_ms is None else slide_in_ms) / 1000
         slide_out_s = (150 if slide_out_ms is None else slide_out_ms) / 1000
 
         screen_w = user32.GetSystemMetrics(0)
@@ -904,9 +900,8 @@ def get_executable_path(pid: int) -> Path:
     handle = kernel32_win.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         raise OSError(f"Process {pid} does not exist.")
-    buf = ctypes.create_unicode_buffer(
-        32767
-    )  # not MAX_PATH (260) - long install paths are common (Steam, OneDrive)
+    # 32767, not MAX_PATH (260) - long install paths (Steam, OneDrive) are common.
+    buf = ctypes.create_unicode_buffer(32767)
     size = wintypes.DWORD(32767)
     ok = kernel32_win.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
     kernel32_win.CloseHandle(handle)
@@ -999,14 +994,18 @@ def play_notification_sound(toast_key: str):
 
 
 def get_pythonw_path() -> str:
-    # Must match the Python OBS itself was pointed at (Tools > Python Settings), not sys.exec_prefix - a mismatch here caused past "Could not load library" failures.
+    # Must match the Python OBS was pointed at (Tools > Scripts > Python Settings), not sys.exec_prefix - a mismatch here caused past "Could not load library" failures.
     base = get_obs_config("Python", "Path64bit", str, ConfigTypes.USER)
     if not base:
-        _print("OBS Python path (Tools > Scripting > Python Settings) is not set; popups cannot render.")
+        _print("OBS Python path (Tools > Scripts > Python Settings) is not set; popups can't render.")
+        return ""
     return os.path.join(base, "pythonw.exe")
 
 
 def show_popup(kind: str, toast_key: str, text_override: str = "", hold: float = 0.0):
+    pythonw = get_pythonw_path()
+    if not pythonw:
+        return
     s = VARIABLES.script_settings
     cfg = {
         "vpos": obs.obs_data_get_string(s, PN.POPUP_VPOS) or "top",
@@ -1021,9 +1020,7 @@ def show_popup(kind: str, toast_key: str, text_override: str = "", hold: float =
         "text_override": text_override,
     }
     try:
-        subprocess.Popen(
-            [get_pythonw_path(), __file__, kind, toast_key, json.dumps(cfg)]
-        )
+        subprocess.Popen([pythonw, __file__, kind, toast_key, json.dumps(cfg)])
     except Exception:
         _print(traceback.format_exc())
 
@@ -1398,9 +1395,7 @@ def detect_new_game():
 
 
 def reconcile_buffer():
-    # Self-heal: if the buffer should be running (a game is linked, or override is on) but
-    # isn't - OBS stopped it externally, an encoder hiccup, OBS's own buffer restarted -
-    # bring it back. Never stops one; that stays the job of the explicit transitions.
+    # Self-heal a buffer that should be running (game linked or override on) but was stopped outside our control - an encoder hiccup, OBS's own restart. Only ever starts it.
     if (
         VARIABLES.buffer_restart_depth == 0
         and capture_target() != "off"
@@ -1589,8 +1584,7 @@ def _foregrounded_linked_exe() -> Path | None:
         return None
     fg = VARIABLES.linked_games.get(get_active_window_pid())
     info = fg or next(iter(VARIABLES.linked_games.values()))
-    exe = info.get("exe")
-    return exe if exe and str(exe) else None
+    return info.get("exe")
 
 
 def gen_clip_base_name() -> str:
@@ -2224,8 +2218,8 @@ def script_description():
     return f"""<div style="font-size: 20pt;">Clip Manager <span style="font-size: 11pt; opacity: 0.7;">v{SCRIPT_VERSION}</span></div>
 <div style="font-size: 10pt;">
 Saves replay buffer clips into per-game folders (named from the captured game, with alias
-overrides), with popup + sound notifications. Use OBS's own Save Replay hotkey to save
-clips - the naming/moving logic runs off OBS's save event, not a hotkey of ours.
+overrides), with popup + sound notifications. Use OBS's own Save Replay Buffer hotkey to
+save clips - the naming and moving runs off OBS's save event, not a hotkey of ours.
 <br/><br/>
 <b>Game clipping</b> (on by default) starts the replay buffer and shows the game capture
 source when a fullscreen app is detected on the primary monitor, and stops when it exits.
@@ -2241,5 +2235,5 @@ and "Toggle mic monitoring" under Settings &gt; Hotkeys (search "Clip Manager").
 <br/><br/>
 Sound files and a volume offset (dB) are configurable per notification under Sounds.
 Source name fields are editable dropdowns. Popups require Pillow in OBS's configured
-Python: pip install pillow
+Python: pythonw.exe -m pip install pillow
 </div>"""
