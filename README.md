@@ -50,12 +50,11 @@ A hotkey mode that hides the game source, shows the Display Capture source, and 
 Toasts appear at the top-right by default and stack downward. A capture change can show two at once — a buffer toast (_Replay on/off_) and a source toast (game/desktop). A repeat of a still-visible kind updates in place instead of stacking.
 
 ```text
-                          ┌──────┬──────────────────────┐
-                          │  ⏺   │  Replay on           │
-                          └──────┴──────────────────────┘
-                          ┌──────┬──────────────────────┐
-                          │  ▣   │  Game clipping on    │
-                          └──────┴──────────────────────┘
++-------+---------------------+
+|  (o)  |  Replay on          |
++-------+---------------------+
+|  [#]  |  Game clipping on   |
++-------+---------------------+
 ```
 
 | Toast                        | Shown when                                                                        |

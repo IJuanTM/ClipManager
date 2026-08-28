@@ -122,12 +122,14 @@ SELF_CONTAINED_ICON_SCALE = 2.0
 GLYPH_ICON_SCALE = 1.1
 # Only the "on" (slash-free) variant's bbox is trustworthy for measuring an off-center glyph - the "off" variant's bbox is dominated by its symmetric diagonal slash regardless of where the glyph sits.
 ICON_Y_OFFSET_SRC_PX = {"display-capture-on": 12.5, "display-capture-off": 12.5}
-ICON_Y_NUDGE_PX = 1  # applies to every icon, not just the ones with a measured offset above
+ICON_Y_NUDGE_PX = (
+    1  # applies to every icon, not just the ones with a measured offset above
+)
 TOAST_HOLD_SECONDS = 2.0
 TOAST_MAX_SLOTS = 8
 STATE_POLL_SECONDS = 0.1
 TOAST_MUTEX_NAME = "Local\\ClipManagerToastStateMutex"
-SCRIPT_VERSION = "0.4.6"
+SCRIPT_VERSION = "0.4.7"
 
 FONT_CANDIDATES = [
     r"C:\Windows\Fonts\segoeuib.ttf",
@@ -192,7 +194,9 @@ if __name__ == "__main__":
         S = lambda v: round_px(v * ss)
         font = load_font(S(font_size))
         # Auto-size width to the text, with the right inset matching the badge's left inset.
-        tb = ImageDraw.Draw(Image.new("L", (1, 1))).textbbox((0, 0), spec["text"], font=font)
+        tb = ImageDraw.Draw(Image.new("L", (1, 1))).textbbox(
+            (0, 0), spec["text"], font=font
+        )
         content_inset = rect_h * (0.5 - 18 / 64)
         rect_w = round_px((text_x - pad) + (tb[2] - tb[0]) / ss + content_inset)
         wnd_w = rect_w + 2 * pad
@@ -476,7 +480,9 @@ if __name__ == "__main__":
         bmi = BITMAPINFO()
         bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
         bmi.bmiHeader.biWidth = img.width
-        bmi.bmiHeader.biHeight = -img.height  # negative = top-down, matches PIL's row order
+        bmi.bmiHeader.biHeight = (
+            -img.height
+        )  # negative = top-down, matches PIL's row order
         bmi.bmiHeader.biPlanes = 1
         bmi.bmiHeader.biBitCount = 32
         bmi.bmiHeader.biCompression = BI_RGB
@@ -746,11 +752,19 @@ class VARIABLES:
     pending_hook_pid = 0
     display_override = False
     display_override_deadline = 0.0
-    sanity_warned: set = set()  # messages already surfaced this session, to avoid re-nagging
-    disk_over_limit = False  # latch so the folder-size warning fires once per threshold crossing
-    disk_warn_msg = ""  # set by the walk thread, surfaced (and cleared) on the OBS thread
+    sanity_warned: set = (
+        set()
+    )  # messages already surfaced this session, to avoid re-nagging
+    disk_over_limit = (
+        False  # latch so the folder-size warning fires once per threshold crossing
+    )
+    disk_warn_msg = (
+        ""  # set by the walk thread, surfaced (and cleared) on the OBS thread
+    )
     last_disk_check = 0.0
-    buffer_start_at = 0.0  # last replay_buffer_start() call, so reconcile_buffer waits it out
+    buffer_start_at = (
+        0.0  # last replay_buffer_start() call, so reconcile_buffer waits it out
+    )
 
 
 class PN:
@@ -997,7 +1011,9 @@ def get_pythonw_path() -> str:
     # Must match the Python OBS was pointed at (Tools > Scripts > Python Settings), not sys.exec_prefix - a mismatch here caused past "Could not load library" failures.
     base = get_obs_config("Python", "Path64bit", str, ConfigTypes.USER)
     if not base:
-        _print("OBS Python path (Tools > Scripts > Python Settings) is not set; popups can't render.")
+        _print(
+            "OBS Python path (Tools > Scripts > Python Settings) is not set; popups can't render."
+        )
         return ""
     return os.path.join(base, "pythonw.exe")
 
@@ -1211,9 +1227,7 @@ def set_scene_source_visible(name: str, visible: bool):
     if not scene_source:
         return
     try:
-        item = obs.obs_scene_find_source(
-            obs.obs_scene_from_source(scene_source), name
-        )
+        item = obs.obs_scene_find_source(obs.obs_scene_from_source(scene_source), name)
         if item and obs.obs_sceneitem_visible(item) != visible:
             obs.obs_sceneitem_set_visible(item, visible)
     finally:
@@ -1400,7 +1414,8 @@ def reconcile_buffer():
         VARIABLES.buffer_restart_depth == 0
         and capture_target() != "off"
         and not obs.obs_frontend_replay_buffer_active()
-        and time.time() - VARIABLES.buffer_start_at >= 8.0  # let a pending start settle first
+        and time.time() - VARIABLES.buffer_start_at
+        >= 8.0  # let a pending start settle first
     ):
         obs.obs_frontend_replay_buffer_start()
         VARIABLES.buffer_start_at = time.time()
@@ -1426,9 +1441,7 @@ def game_poll_callback():
 
 def setup_game_poll_timer():
     obs.timer_remove(game_poll_callback)
-    interval = (
-        obs.obs_data_get_int(VARIABLES.script_settings, PN.GAME_POLL_MS) or 3000
-    )
+    interval = obs.obs_data_get_int(VARIABLES.script_settings, PN.GAME_POLL_MS) or 3000
     obs.timer_add(game_poll_callback, interval)
 
 
@@ -1734,7 +1747,9 @@ def on_buffer_started_callback(event):
     if event != obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED:
         return
     VARIABLES.clip_exe_history = deque([], maxlen=get_replay_buffer_max_time())
-    obs.timer_remove(append_clip_exe_history)  # this event also fires from the restart cycle
+    obs.timer_remove(
+        append_clip_exe_history
+    )  # this event also fires from the restart cycle
     obs.timer_remove(restart_replay_buffering_callback)
     obs.timer_add(append_clip_exe_history, 1000)
     if loop_time := obs.obs_data_get_int(
@@ -1913,7 +1928,12 @@ def add_source_dropdown(g, prop_name, label):
 
 def setup_paths_group(g):
     obs.obs_properties_add_path(
-        g, PN.BASE_PATH, "Clips folder", obs.OBS_PATH_DIRECTORY, None, str(get_base_path())
+        g,
+        PN.BASE_PATH,
+        "Clips folder",
+        obs.OBS_PATH_DIRECTORY,
+        None,
+        str(get_base_path()),
     )
     obs.obs_properties_add_text(
         g, PN.FILENAME_TEMPLATE, "Filename template", obs.OBS_TEXT_DEFAULT
@@ -1935,7 +1955,10 @@ def setup_sources_group(g):
     add_source_dropdown(g, PN.DESKTOP_SOURCE_NAME, "Display capture source")
     mic_prop = add_source_dropdown(g, PN.MIC_SOURCE_NAME, "Mic source")
     obs.obs_properties_add_text(
-        g, "sources_info", 'Bind keys in Settings > Hotkeys ("Clip Manager").', obs.OBS_TEXT_INFO
+        g,
+        "sources_info",
+        'Bind keys in Settings > Hotkeys ("Clip Manager").',
+        obs.OBS_TEXT_INFO,
     )
     # Mic signal binds to one named source, so a name change needs a reconnect.
     obs.obs_property_set_modified_callback(mic_prop, update_mic_source_callback)
