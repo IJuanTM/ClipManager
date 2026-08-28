@@ -1,0 +1,8 @@
+__pycache__/
+.mypy_cache/
+
+toast_state.json
+toast_state.*.tmp
+clip_manager_gain_*.wav
+
+.claude

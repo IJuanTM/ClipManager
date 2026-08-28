@@ -1,0 +1,10 @@
+{
+  "typeCheckingMode": "off",
+  "pythonVersion": "3.10",
+  "pythonPlatform": "Windows",
+  "stubPath": "typings",
+  "extraPaths": [
+    "${env:LOCALAPPDATA}/Programs/Python/Python310/Lib/site-packages"
+  ],
+  "reportMissingModuleSource": "none"
+}
