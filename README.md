@@ -24,10 +24,10 @@ An OBS Studio script that files replay-buffer clips into per-game folders, names
 
 ### Game clipping
 
-Every few seconds the script checks the foreground window. If it is a fullscreen app on the primary monitor and not in the exceptions list, the script shows the Game Capture source and, about **3 s** later, checks whether OBS actually hooked it:
+Every few seconds the script checks the foreground window. If it is a fullscreen app on the primary monitor and not in the exceptions list, the script shows the Game Capture source and waits for OBS to confirm the hook — it listens for OBS's own _hooked_ signal and also watches whether the source has started rendering:
 
-- **Hooked** — start the replay buffer, show _Game clipping on_.
-- **Not hooked** — show _No game to capture_ and, if _Fall back to desktop on fail_ is on, switch to Display override.
+- **Hooked** — start the replay buffer, show _Game clipping on_. This is usually within a second or two of the game finishing loading.
+- **Not hooked after ~15 s** — show _No game to capture_ and, if _Fall back to desktop on fail_ is on, switch to Display override. The wait is generous on purpose: a game detected while still on a loading screen can take several seconds before OBS can hook it.
 
 The link is a set of processes: the buffer runs while at least one detected game is open and stops a grace period (default **30 s**) after the last one exits. The _Game clipping off_ hotkey drops the foreground game immediately and won't re-detect it until it restarts. Manual _Game clipping on_ runs the same detect-and-hook sequence once, right away.
 
@@ -136,7 +136,7 @@ Grouped in the script's settings panel, behavioural groups first.
 | Grace after game exits       | 0–600 s — **30**                                                         |
 | Fall back to desktop on fail | On / Off — **On**                                                        |
 | Desktop auto-off             | 0–1440 min (**0** = never) — **60**                                      |
-| Exceptions                   | exe name or folder path, one per line — pre-filled with browsers, media players, `explorer.exe`, `LockApp.exe` |
+| Exceptions                   | exe name or folder path, one per line — pre-filled with browsers, media players, the Windows shell, the lock screen, and the screen-snip tools |
 
 ### Clip files
 

@@ -129,7 +129,7 @@ TOAST_HOLD_SECONDS = 2.0
 TOAST_MAX_SLOTS = 8
 STATE_POLL_SECONDS = 0.1
 TOAST_MUTEX_NAME = "Local\\ClipManagerToastStateMutex"
-SCRIPT_VERSION = "0.4.7"
+SCRIPT_VERSION = "0.4.8"
 
 FONT_CANDIDATES = [
     r"C:\Windows\Fonts\segoeuib.ttf",
@@ -741,7 +741,7 @@ class VARIABLES:
     hotkey_ids: dict = {}
     aliases: dict[Path, str] = {}
     clip_exe_history: deque | None = None
-    mic_signal_handler = None
+    mic_signal_source = None  # held source ref keeps its signal handler alive; released on reconnect/unload
     buffer_restart_depth = 0
     buffer_restart_lock = Lock()
     auto_buffer_exceptions: set = set()
@@ -750,6 +750,12 @@ class VARIABLES:
     handled_games: dict = {}
     game_empty_since = 0.0
     pending_hook_pid = 0
+    pending_hook_exe = ""
+    pending_hook_confirmed = False  # set off-thread by the game-capture "hooked" signal
+    pending_hook_deadline = 0.0
+    game_hook_source = (
+        None  # held source ref for the "hooked" signal; released in end_pending_hook
+    )
     display_override = False
     display_override_deadline = 0.0
     sanity_warned: set = (
@@ -1298,7 +1304,7 @@ def clear_capture_tracking():
     VARIABLES.linked_games = {}
     VARIABLES.handled_games = {}
     VARIABLES.game_empty_since = 0.0
-    VARIABLES.pending_hook_pid = 0
+    end_pending_hook()
 
 
 def reap_dead_games():
@@ -1333,22 +1339,74 @@ def maybe_stop_after_grace():
         notify("game_off", "game")
 
 
+# Game Capture can take several seconds to latch onto a still-launching game before its "hooked" signal fires.
+HOOK_CONFIRM_TIMEOUT_S = 15
+
+
+def on_game_capture_hooked(calldata):
+    # Fires on OBS's capture thread - touch a plain flag only; resolve_pending_hook (poll thread) acts on it.
+    exe = os.path.basename((obs.calldata_string(calldata, "executable") or "").lower())
+    want = VARIABLES.pending_hook_exe
+    if not want or not exe or exe == want:
+        VARIABLES.pending_hook_confirmed = True
+
+
+def connect_game_hook_signal():
+    src_name = _setting_str(PN.GAME_SOURCE_NAME)
+    src = obs.obs_get_source_by_name(src_name) if src_name else None
+    if not src:
+        return
+    obs.signal_handler_connect(
+        obs.obs_source_get_signal_handler(src), "hooked", on_game_capture_hooked
+    )
+    VARIABLES.game_hook_source = (
+        src  # keep the ref (don't release) so the handler outlives this call
+    )
+
+
+def end_pending_hook():
+    if VARIABLES.game_hook_source is not None:
+        with suppress(Exception):
+            obs.signal_handler_disconnect(
+                obs.obs_source_get_signal_handler(VARIABLES.game_hook_source),
+                "hooked",
+                on_game_capture_hooked,
+            )
+        obs.obs_source_release(VARIABLES.game_hook_source)
+    VARIABLES.game_hook_source = None
+    VARIABLES.pending_hook_pid = 0
+    VARIABLES.pending_hook_exe = ""
+    VARIABLES.pending_hook_confirmed = False
+    VARIABLES.pending_hook_deadline = 0.0
+
+
 def begin_game_hook(pid: int):
+    end_pending_hook()
     VARIABLES.pending_hook_pid = pid
+    VARIABLES.pending_hook_deadline = time.time() + HOOK_CONFIRM_TIMEOUT_S
+    with suppress(Exception):
+        VARIABLES.pending_hook_exe = get_executable_path(pid).name.lower()
     set_scene_source_visible(_setting_str(PN.GAME_SOURCE_NAME), True)
-    obs.timer_remove(game_hook_check)
-    obs.timer_add(game_hook_check, 3000)
+    connect_game_hook_signal()
 
 
-def game_hook_check():
-    obs.timer_remove(game_hook_check)
-    pid, VARIABLES.pending_hook_pid = VARIABLES.pending_hook_pid, 0
-    if not pid or VARIABLES.display_override:
-        # Override was engaged during the wait; drop this hook, it re-detects when override ends.
+def resolve_pending_hook():
+    pid = VARIABLES.pending_hook_pid
+    if not pid:
+        return
+    if VARIABLES.display_override:
+        end_pending_hook()  # override took over during the wait; it re-detects when override ends
         apply_capture_state()
         return
+    hooked = (
+        VARIABLES.pending_hook_confirmed
+        or source_width(_setting_str(PN.GAME_SOURCE_NAME)) > 0
+    )
+    if not hooked and time.time() < VARIABLES.pending_hook_deadline:
+        return
+    end_pending_hook()
     with suppress(Exception):
-        finish_game_hook(pid)
+        finish_game_hook(pid, hooked)
 
 
 def _exe_label(pid: int) -> str:
@@ -1357,9 +1415,9 @@ def _exe_label(pid: int) -> str:
     return "game"
 
 
-def finish_game_hook(pid: int):
+def finish_game_hook(pid: int, hooked: bool):
     game_name = _setting_str(PN.GAME_SOURCE_NAME)
-    if source_width(game_name) > 0:
+    if hooked:
         handle = open_tracking_handle(pid)
         if not handle:
             set_scene_source_visible(game_name, bool(VARIABLES.linked_games))
@@ -1431,6 +1489,7 @@ def game_poll_callback():
         return
     with suppress(Exception):
         reap_dead_games()
+        resolve_pending_hook()
         if VARIABLES.display_override:
             check_display_override_timeout()
         elif obs.obs_data_get_bool(VARIABLES.script_settings, PN.AUTO_GAME_CLIPPING):
@@ -1527,8 +1586,7 @@ def game_clipping_on():
 def game_clipping_off():
     pending = VARIABLES.pending_hook_pid
     if pending:
-        VARIABLES.pending_hook_pid = 0
-        obs.timer_remove(game_hook_check)
+        end_pending_hook()
         h = open_tracking_handle(pending)
         if h:
             VARIABLES.handled_games[pending] = h
@@ -1774,6 +1832,25 @@ def on_mic_mute_signal(calldata):
     notify("mic_off" if muted else "mic_on", "mic")
 
 
+def get_mic_source():
+    # Caller owns the ref and must obs_source_release it (unless keeping it deliberately, as connect_mic_signal does).
+    name = obs.obs_data_get_string(VARIABLES.script_settings, PN.MIC_SOURCE_NAME)
+    return obs.obs_get_source_by_name(name) if name else None
+
+
+def disconnect_mic_signal():
+    if VARIABLES.mic_signal_source is None:
+        return
+    with suppress(Exception):
+        obs.signal_handler_disconnect(
+            obs.obs_source_get_signal_handler(VARIABLES.mic_signal_source),
+            "mute",
+            on_mic_mute_signal,
+        )
+    obs.obs_source_release(VARIABLES.mic_signal_source)
+    VARIABLES.mic_signal_source = None
+
+
 def connect_mic_signal():
     name = obs.obs_data_get_string(VARIABLES.script_settings, PN.MIC_SOURCE_NAME)
     source = obs.obs_get_source_by_name(name) if name else None
@@ -1781,18 +1858,16 @@ def connect_mic_signal():
         # Don't tear down a working connection just because the source is briefly unresolvable.
         _print(f"[mic] source '{name}' not found; keeping any existing connection")
         return
-    if VARIABLES.mic_signal_handler:
-        obs.signal_handler_disconnect(
-            VARIABLES.mic_signal_handler, "mute", on_mic_mute_signal
-        )
-        VARIABLES.mic_signal_handler = None
+    disconnect_mic_signal()
     if not source:
         _print("[mic] no mic source name set")
         return
-    sh = obs.obs_source_get_signal_handler(source)
-    obs.signal_handler_connect(sh, "mute", on_mic_mute_signal)
-    VARIABLES.mic_signal_handler = sh
-    obs.obs_source_release(source)
+    obs.signal_handler_connect(
+        obs.obs_source_get_signal_handler(source), "mute", on_mic_mute_signal
+    )
+    VARIABLES.mic_signal_source = (
+        source  # keep the ref so the signal handler can't be freed under us
+    )
     _print(f"[mic] mute signal connected to '{name}'")
 
 
@@ -1806,26 +1881,18 @@ def on_frontend_ready_callback(event):
 
 # -------------------- hotkeys --------------------
 def toggle_mic_mute():
-    name = obs.obs_data_get_string(VARIABLES.script_settings, PN.MIC_SOURCE_NAME)
-    if not name:
-        _print("Mic source name is not set.")
-        return
-    source = obs.obs_get_source_by_name(name)
+    source = get_mic_source()
     if not source:
-        _print(f"Mic source '{name}' not found.")
+        _print("Mic source is not set or not found.")
         return
     obs.obs_source_set_muted(source, not obs.obs_source_muted(source))
     obs.obs_source_release(source)
 
 
 def toggle_mic_monitoring():
-    name = obs.obs_data_get_string(VARIABLES.script_settings, PN.MIC_SOURCE_NAME)
-    if not name:
-        _print("Mic source name is not set.")
-        return
-    source = obs.obs_get_source_by_name(name)
+    source = get_mic_source()
     if not source:
-        _print(f"Mic source '{name}' not found.")
+        _print("Mic source is not set or not found.")
         return
     currently_on = (
         obs.obs_source_get_monitoring_type(source) != obs.OBS_MONITORING_TYPE_NONE
@@ -2165,6 +2232,10 @@ def script_defaults(s):
     non_game_fullscreen_exes = (
         "explorer.exe",
         "LockApp.exe",
+        # Screen-snip overlays span the primary monitor without being maximized.
+        "SnippingTool.exe",
+        "ScreenClippingHost.exe",
+        "ScreenSketch.exe",
         "vlc.exe",
         "mpv.exe",
         "mpc-hc64.exe",
@@ -2220,12 +2291,8 @@ def script_unload():
     obs.timer_remove(append_clip_exe_history)
     obs.timer_remove(restart_replay_buffering_callback)
     obs.timer_remove(game_poll_callback)
-    obs.timer_remove(game_hook_check)
     obs.timer_remove(disk_check_tick)
-    if VARIABLES.mic_signal_handler:
-        obs.signal_handler_disconnect(
-            VARIABLES.mic_signal_handler, "mute", on_mic_mute_signal
-        )
+    disconnect_mic_signal()
     # Without these, a reload leaves the old callbacks/hotkeys registered alongside the new ones - every replay save / scene change / bound key would then fire twice.
     obs.obs_frontend_remove_event_callback(on_buffer_save_callback)
     obs.obs_frontend_remove_event_callback(on_buffer_started_callback)
