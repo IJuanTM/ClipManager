@@ -59,6 +59,22 @@ TOASTS = {
         "self_contained": True,
         "text": "No game to capture",
     },
+    "game_detecting": {
+        "icon": "info",
+        "self_contained": True,
+        "text": "Game detected",
+    },
+    "game_connecting": {
+        "icon": "info",
+        "self_contained": True,
+        "text": "Connecting capture",
+    },
+    "game_ending": {
+        "icon": "game-capture-off",
+        "self_contained": False,
+        "badge": "#6b7280",
+        "text": "Game closed",
+    },
     "warning": {"icon": "warning", "self_contained": True, "text": "Warning"},
     "info": {"icon": "info", "self_contained": True, "text": "Info"},
     "desktop_on": {
@@ -98,6 +114,8 @@ TOASTS = {
         "text": "Listening off",
     },
 }
+# Verbose "still working" toasts - popup only, so they get no per-toast sound picker / sound file.
+STATUS_TOAST_KEYS = {"game_detecting", "game_connecting", "game_ending"}
 SOUND_DEFAULT_FILES = {
     "replay_saved": "success.wav",
     "replay_failed": "failure.wav",
@@ -129,7 +147,7 @@ TOAST_HOLD_SECONDS = 2.0
 TOAST_MAX_SLOTS = 8
 STATE_POLL_SECONDS = 0.1
 TOAST_MUTEX_NAME = "Local\\ClipManagerToastStateMutex"
-SCRIPT_VERSION = "0.4.8"
+SCRIPT_VERSION = "0.4.9"
 
 FONT_CANDIDATES = [
     r"C:\Windows\Fonts\segoeuib.ttf",
@@ -753,6 +771,12 @@ class VARIABLES:
     pending_hook_exe = ""
     pending_hook_confirmed = False  # set off-thread by the game-capture "hooked" signal
     pending_hook_deadline = 0.0
+    # One in-flight hook at a time, so its retry count is two scalars, not a pid map.
+    hook_retry_pid = 0
+    hook_retry_count = 0
+    detect_note = (
+        ""  # last [detect] line printed, so the per-poll scan doesn't spam the log
+    )
     game_hook_source = (
         None  # held source ref for the "hooked" signal; released in end_pending_hook
     )
@@ -801,6 +825,7 @@ class PN:
     NOTIFY_TOGGLE_SOUND = "notify_toggle_sound"
     NOTIFY_TOGGLE_POPUP = "notify_toggle_popup"
     NOTIFY_CLIP_DISABLED = "notify_clip_disabled"
+    NOTIFY_VERBOSE = "notify_verbose"
 
     POPUP_VPOS = "popup_vpos"
     POPUP_HPOS = "popup_hpos"
@@ -900,6 +925,10 @@ kernel32_win.QueryFullProcessImageNameW.argtypes = [
     ctypes.POINTER(wintypes.DWORD),
 ]
 kernel32_win.QueryFullProcessImageNameW.restype = wintypes.BOOL
+kernel32_win.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
+    ctypes.POINTER(wintypes.FILETIME)
+] * 4
+kernel32_win.GetProcessTimes.restype = wintypes.BOOL
 
 
 def get_active_window_pid() -> int:
@@ -916,11 +945,11 @@ def get_window_class(hwnd) -> str:
 
 
 def get_executable_path(pid: int) -> Path:
-    # QueryFullProcessImageNameW + PROCESS_QUERY_LIMITED_INFORMATION resolves elevated/anti-cheat processes that GetModuleFileNameEx + VM_READ cannot.
+    # QueryFullProcessImageNameW + PROCESS_QUERY_LIMITED_INFORMATION resolves elevated / protected processes that GetModuleFileNameEx + VM_READ cannot.
     handle = kernel32_win.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         raise OSError(f"Process {pid} does not exist.")
-    # 32767, not MAX_PATH (260) - long install paths (Steam, OneDrive) are common.
+    # 32767, not MAX_PATH (260) - deeply nested install paths are common.
     buf = ctypes.create_unicode_buffer(32767)
     size = wintypes.DWORD(32767)
     ok = kernel32_win.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
@@ -1284,9 +1313,11 @@ def apply_capture_state():
         return  # mid internal restart; it ends with the buffer running, next poll reconciles
     running = obs.obs_frontend_replay_buffer_active()
     if target == "off" and running:
+        _print("[capture] nothing to capture; stopping replay buffer")
         obs.obs_frontend_replay_buffer_stop()
         notify("buffer_off", "buffer")
     elif target != "off" and not running:
+        _print(f"[capture] target '{target}'; starting replay buffer")
         obs.obs_frontend_replay_buffer_start()
         VARIABLES.buffer_start_at = time.time()
         notify("buffer_on", "buffer")
@@ -1298,26 +1329,78 @@ def _close_handles(*handles):
             kernel32_win.CloseHandle(h)
 
 
+def _clear_hook_retry():
+    VARIABLES.hook_retry_pid = 0
+    VARIABLES.hook_retry_count = 0
+
+
 def clear_capture_tracking():
     _close_handles(*(g["handle"] for g in VARIABLES.linked_games.values()))
     _close_handles(*VARIABLES.handled_games.values())
     VARIABLES.linked_games = {}
     VARIABLES.handled_games = {}
+    _clear_hook_retry()
     VARIABLES.game_empty_since = 0.0
     end_pending_hook()
+
+
+def _linked_label(info: dict) -> str:
+    exe = info.get("exe")
+    return exe.stem if exe else "game"
+
+
+def _pid_alive(pid: int) -> bool:
+    h = kernel32_win.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return False
+    kernel32_win.CloseHandle(h)
+    return True
+
+
+def _process_start_ticks(pid: int) -> int:
+    # Creation time as FILETIME ticks (0 if unreadable) - the only thing that tells a recycled PID apart from the original.
+    h = kernel32_win.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return 0
+    try:
+        created, other = wintypes.FILETIME(), wintypes.FILETIME()
+        if kernel32_win.GetProcessTimes(
+            h, ctypes.byref(created), *([ctypes.byref(other)] * 3)
+        ):
+            return created.dwHighDateTime << 32 | created.dwLowDateTime
+        return 0
+    finally:
+        kernel32_win.CloseHandle(h)
+
+
+def _capture_target_gone(handle: int, pid: int, start: int = 0) -> bool:
+    # Real wait handle: authoritative. No handle (protected process): gone if the PID vanished, or if it now belongs to a different process (recycled).
+    if handle:
+        return process_exited(handle)
+    if not _pid_alive(pid):
+        return True
+    return bool(start) and _process_start_ticks(pid) != start
 
 
 def reap_dead_games():
     had_linked = bool(VARIABLES.linked_games)
     for pid, info in list(VARIABLES.linked_games.items()):
-        if process_exited(info["handle"]):
+        if _capture_target_gone(info["handle"], pid, info.get("start", 0)):
+            _print(f"[capture] linked game exited: {_linked_label(info)} (pid {pid})")
             _close_handles(VARIABLES.linked_games.pop(pid)["handle"])
     for pid, handle in list(VARIABLES.handled_games.items()):
-        if process_exited(handle):
+        if _capture_target_gone(handle, pid):
+            _print(
+                f"[capture] dismissed game exited (pid {pid}); it can be auto-detected again"
+            )
             _close_handles(VARIABLES.handled_games.pop(pid))
     # Start the grace clock only on the transition to "no linked game", not for an idle session.
     if had_linked and not VARIABLES.linked_games and not VARIABLES.game_empty_since:
         VARIABLES.game_empty_since = time.time()
+        _print(
+            f"[capture] no games left; stopping capture in {grace_seconds()}s unless one comes back"
+        )
+        notify_status("game_ending")
 
 
 def grace_seconds() -> int:
@@ -1335,12 +1418,15 @@ def maybe_stop_after_grace():
         and time.time() - VARIABLES.game_empty_since >= grace_seconds()
     ):
         VARIABLES.game_empty_since = 0.0
+        _print("[capture] grace elapsed with no game; stopping capture")
         apply_capture_state()
         notify("game_off", "game")
 
 
-# Game Capture can take several seconds to latch onto a still-launching game before its "hooked" signal fires.
-HOOK_CONFIRM_TIMEOUT_S = 15
+# Short first window frees the source fast on a misdetect; the long retry covers games that take a minute to become hookable.
+HOOK_FIRST_TIMEOUT_S = 30
+HOOK_CONFIRM_TIMEOUT_S = 120
+HOOK_MAX_ATTEMPTS = 2
 
 
 def on_game_capture_hooked(calldata):
@@ -1382,12 +1468,22 @@ def end_pending_hook():
 
 def begin_game_hook(pid: int):
     end_pending_hook()
+    first_try = pid != VARIABLES.hook_retry_pid
+    wait = HOOK_FIRST_TIMEOUT_S if first_try else HOOK_CONFIRM_TIMEOUT_S
     VARIABLES.pending_hook_pid = pid
-    VARIABLES.pending_hook_deadline = time.time() + HOOK_CONFIRM_TIMEOUT_S
+    VARIABLES.pending_hook_deadline = time.time() + wait
     with suppress(Exception):
         VARIABLES.pending_hook_exe = get_executable_path(pid).name.lower()
     set_scene_source_visible(_setting_str(PN.GAME_SOURCE_NAME), True)
     connect_game_hook_signal()
+    label = _exe_label(pid)
+    if first_try:
+        _print(
+            f"[hook] {label} (pid {pid}) detected; game source on, waiting up to {wait}s for OBS to capture it"
+        )
+        notify_status("game_detecting", f"{label} detected")
+    else:
+        _print(f"[hook] re-arming capture hook for {label} (pid {pid}); {wait}s window")
 
 
 def resolve_pending_hook():
@@ -1395,15 +1491,29 @@ def resolve_pending_hook():
     if not pid:
         return
     if VARIABLES.display_override:
+        _print("[hook] display override took over; abandoning the pending hook")
         end_pending_hook()  # override took over during the wait; it re-detects when override ends
+        _clear_hook_retry()  # give the game a fresh retry budget when override ends
         apply_capture_state()
         return
-    hooked = (
-        VARIABLES.pending_hook_confirmed
-        or source_width(_setting_str(PN.GAME_SOURCE_NAME)) > 0
-    )
-    if not hooked and time.time() < VARIABLES.pending_hook_deadline:
-        return
+    via_signal = VARIABLES.pending_hook_confirmed
+    hooked = via_signal or source_width(_setting_str(PN.GAME_SOURCE_NAME)) > 0
+    if not hooked:
+        # pending_hook_exe set means it was openable at detect, so a failed re-open now = it exited (crash / closed on a loading screen), not just protected.
+        if VARIABLES.pending_hook_exe and not _pid_alive(pid):
+            _print(
+                f"[hook] pending game (pid {pid}) exited before it hooked; abandoning"
+            )
+            end_pending_hook()
+            _clear_hook_retry()
+            apply_capture_state()  # every other terminal hook path reconciles source visibility; this one must too
+            return
+        if time.time() < VARIABLES.pending_hook_deadline:
+            return
+    else:
+        _print(
+            f"[hook] capture confirmed via {'OBS signal' if via_signal else 'source width'}"
+        )
     end_pending_hook()
     with suppress(Exception):
         finish_game_hook(pid, hooked)
@@ -1418,22 +1528,42 @@ def _exe_label(pid: int) -> str:
 def finish_game_hook(pid: int, hooked: bool):
     game_name = _setting_str(PN.GAME_SOURCE_NAME)
     if hooked:
-        handle = open_tracking_handle(pid)
-        if not handle:
-            set_scene_source_visible(game_name, bool(VARIABLES.linked_games))
-            return
         exe = None
         with suppress(Exception):
             exe = get_executable_path(pid)
-        VARIABLES.linked_games[pid] = {"handle": handle, "exe": exe}
+        # open may fail for a protected process - link anyway (OBS is capturing it) and note its start time so reap_dead_games can still tell when it exits.
+        handle = open_tracking_handle(pid)
+        info = {"handle": handle, "exe": exe}
+        if not handle:
+            info["start"] = _process_start_ticks(pid)
+        VARIABLES.linked_games[pid] = info
         VARIABLES.game_empty_since = 0.0
+        _clear_hook_retry()
+        _print(
+            f"[hook] linked {exe.stem if exe else pid}{' (no wait handle)' if not handle else ''}; capture is live ({len(VARIABLES.linked_games)} game(s) tracked)"
+        )
         apply_capture_state()
         notify("game_on", "game")
         return
+    attempt = VARIABLES.hook_retry_count + 1 if pid == VARIABLES.hook_retry_pid else 1
+    VARIABLES.hook_retry_pid = pid
+    VARIABLES.hook_retry_count = attempt
+    if attempt < HOOK_MAX_ATTEMPTS:
+        # Re-arm here, not via detect_new_game() - that's gated behind AUTO_GAME_CLIPPING and the manual hotkey path needs the retry too.
+        _print(
+            f"[hook] no capture yet for {_exe_label(pid)} (try {attempt}/{HOOK_MAX_ATTEMPTS}); keeping the source up and retrying"
+        )
+        notify_status(
+            "game_connecting",
+            f"Still connecting {_exe_label(pid)} ({attempt}/{HOOK_MAX_ATTEMPTS})",
+        )
+        begin_game_hook(pid)
+        return
+    _clear_hook_retry()
+    _print(f"[hook] giving up on {_exe_label(pid)} after {HOOK_MAX_ATTEMPTS} tries")
     set_scene_source_visible(game_name, bool(VARIABLES.linked_games))
-    handle = open_tracking_handle(pid)
-    if handle:
-        VARIABLES.handled_games[pid] = handle
+    # open may fail (protected process) - still record the pid so it isn't re-detected every poll.
+    VARIABLES.handled_games[pid] = open_tracking_handle(pid)
     label = _exe_label(pid)
     if not game_name:
         warn_once("No game capture source set; game clipping can't confirm a hook.")
@@ -1448,7 +1578,21 @@ def finish_game_hook(pid: int, hooked: bool):
         )
     notify("game_failed", "game", f"Couldn't capture {label}")
     if obs.obs_data_get_bool(VARIABLES.script_settings, PN.AUTO_SWITCH_ON_HOOK_FAIL):
+        _print(
+            "[hook] 'Fall back to desktop on fail' is on; switching to display capture"
+        )
         enable_display_override(auto=True)
+    else:
+        _print(
+            f"[hook] {label} left in the dismissed list; use the Game clipping hotkey to try again"
+        )
+
+
+def _detect_log(msg: str):
+    # De-duped: the poll runs every few seconds and would otherwise repeat the same line forever.
+    if msg != VARIABLES.detect_note:
+        VARIABLES.detect_note = msg
+        _print(f"[detect] {msg}")
 
 
 def detect_new_game():
@@ -1456,13 +1600,29 @@ def detect_new_game():
         return
     fullscreen, pid = is_foreground_window_fullscreen()
     if not (fullscreen and pid):
+        VARIABLES.detect_note = (
+            ""  # foreground isn't a fullscreen game; let the next real event log fresh
+        )
         return
-    if pid in VARIABLES.linked_games or pid in VARIABLES.handled_games:
+    # Cheap membership checks first; only resolve the exe name (a syscall) once the pid is actually new.
+    if pid in VARIABLES.linked_games:
+        _detect_log(f"{_linked_label(VARIABLES.linked_games[pid])} already linked")
         return
-    # Fail open (not-excepted) if the exe lookup fails - elevated / anti-cheat games are exactly the ones this matters for.
+    if pid in VARIABLES.handled_games:
+        _detect_log(
+            f"pid {pid} was dismissed this session; press the Game clipping hotkey to re-enable"
+        )
+        return
+    # One path lookup for both the label and the exception check. Fail open (not-excepted) if it fails - elevated / protected games are exactly the ones this matters for.
+    label, excepted = "game", False
     with suppress(Exception):
-        if is_exe_excepted(get_executable_path(pid)):
-            return
+        exe_path = get_executable_path(pid)
+        label, excepted = exe_path.stem, is_exe_excepted(exe_path)
+    if excepted:
+        _detect_log(f"ignoring {label} - it's in the exceptions list")
+        return
+    VARIABLES.detect_note = ""
+    _print(f"[detect] fullscreen game in foreground: {label} (pid {pid})")
     begin_game_hook(pid)
 
 
@@ -1475,6 +1635,7 @@ def reconcile_buffer():
         and time.time() - VARIABLES.buffer_start_at
         >= 8.0  # let a pending start settle first
     ):
+        _print("[buffer] replay buffer was down while capture is active; restarting it")
         obs.obs_frontend_replay_buffer_start()
         VARIABLES.buffer_start_at = time.time()
         notify("buffer_on", "buffer")
@@ -1487,7 +1648,7 @@ def game_poll_callback():
         notify("warning", "warning", msg, hold=8.0)
     if VARIABLES.buffer_restart_depth > 0:
         return
-    with suppress(Exception):
+    try:
         reap_dead_games()
         resolve_pending_hook()
         if VARIABLES.display_override:
@@ -1496,6 +1657,8 @@ def game_poll_callback():
             detect_new_game()
         maybe_stop_after_grace()
         reconcile_buffer()
+    except Exception:
+        _print("[poll] unhandled error in the capture poll:\n" + traceback.format_exc())
 
 
 def setup_game_poll_timer():
@@ -1565,15 +1728,20 @@ def disk_check_tick():
 
 # -------------------- capture actions (hotkeys) --------------------
 def game_clipping_on():
+    _print("[hotkey] Game clipping on")
     if VARIABLES.display_override:
+        _print("[hotkey] ignored - display override is active; turn that off first")
         return  # display override outranks game clipping; turn it off first
     fg = get_active_window_pid()
     if fg in VARIABLES.handled_games:
+        _print(f"[hotkey] clearing {_exe_label(fg)} from the dismissed list")
         _close_handles(VARIABLES.handled_games.pop(fg))
     if fg in VARIABLES.linked_games or VARIABLES.pending_hook_pid:
+        _print("[hotkey] ignored - a game is already linked or hooking")
         return
     fullscreen, pid = is_foreground_window_fullscreen()
     if not (fullscreen and pid):
+        _print("[hotkey] no fullscreen game in the foreground")
         notify("game_failed", "game", "No fullscreen game found")
         return
     if pid in VARIABLES.linked_games:
@@ -1584,17 +1752,21 @@ def game_clipping_on():
 
 
 def game_clipping_off():
+    _print("[hotkey] Game clipping off")
     pending = VARIABLES.pending_hook_pid
     if pending:
         end_pending_hook()
-        h = open_tracking_handle(pending)
-        if h:
-            VARIABLES.handled_games[pending] = h
+        _clear_hook_retry()
+        VARIABLES.handled_games[pending] = open_tracking_handle(pending)
     fg = get_active_window_pid()
     targets = [fg] if fg in VARIABLES.linked_games else list(VARIABLES.linked_games)
     if not targets and not pending:
+        _print("[hotkey] nothing to stop")
         return
     for pid in targets:
+        _print(
+            f"[hotkey] dismissing {_linked_label(VARIABLES.linked_games[pid])} (pid {pid})"
+        )
         VARIABLES.handled_games[pid] = VARIABLES.linked_games.pop(pid)["handle"]
     VARIABLES.game_empty_since = 0.0  # deliberate stop, no grace
     apply_capture_state()
@@ -1621,6 +1793,7 @@ def enable_display_override(auto: bool = False):
         return
     VARIABLES.display_override = True
     _reset_override_deadline()
+    _print(f"[display] override ON ({'auto - game hook failed' if auto else 'manual'})")
     apply_capture_state()
     notify("desktop_on", "desktop", "Switched to desktop capture" if auto else "")
 
@@ -1630,9 +1803,11 @@ def disable_display_override(timed_out: bool = False):
         return
     VARIABLES.display_override = False
     VARIABLES.display_override_deadline = 0.0
+    _print(f"[display] override OFF ({'timed out' if timed_out else 'manual'})")
     apply_capture_state()
     notify("desktop_off", "desktop", "Desktop capture timed out" if timed_out else "")
     if VARIABLES.linked_games:
+        _print("[display] a game is still linked; game clipping resumes")
         notify("game_on", "game")  # a game was still linked; game clipping resumes
 
 
@@ -1667,7 +1842,7 @@ def gen_clip_base_name() -> str:
         with suppress(Exception):
             exe_path = get_executable_path(get_active_window_pid())
     if exe_path is None:
-        return "Unknown"  # elevated / anti-cheat process we could never resolve
+        return "Unknown"  # elevated / protected process we could never resolve
     return get_alias(exe_path) or exe_path.stem
 
 
@@ -1727,17 +1902,32 @@ def notify_clip(success: bool):
             show_popup("replay", toast_key)
 
 
-def notify(toast_key: str, kind: str, text_override: str = "", hold: float = 0.0):
+def notify(
+    toast_key: str,
+    kind: str,
+    text_override: str = "",
+    hold: float = 0.0,
+    silent: bool = False,
+):
     with suppress(Exception):
-        if obs.obs_data_get_bool(VARIABLES.script_settings, PN.NOTIFY_TOGGLE_SOUND):
+        if not silent and obs.obs_data_get_bool(
+            VARIABLES.script_settings, PN.NOTIFY_TOGGLE_SOUND
+        ):
             play_notification_sound(toast_key)
         if obs.obs_data_get_bool(VARIABLES.script_settings, PN.NOTIFY_TOGGLE_POPUP):
             show_popup(kind, toast_key, text_override, hold)
 
 
+def notify_status(toast_key: str, text_override: str = "", hold: float = 0.0):
+    # Intermediate "still working" popups - silent, verbose-gated, and on their own popup slot so they never overwrite a real capture / warning toast.
+    with suppress(Exception):
+        if obs.obs_data_get_bool(VARIABLES.script_settings, PN.NOTIFY_VERBOSE):
+            notify(toast_key, "status", text_override, hold, silent=True)
+
+
 # -------------------- replay buffer save flow --------------------
 def restart_replay_buffering():
-    _print("Restarting replay buffering...")
+    _print("[buffer] restarting replay buffering (periodic / post-save refresh)")
     with VARIABLES.buffer_restart_lock:
         VARIABLES.buffer_restart_depth += 1
     try:
@@ -2037,7 +2227,16 @@ def setup_notifications_group(g):
     obs.obs_properties_add_bool(g, PN.NOTIFY_TOGGLE_SOUND, "Sound on capture toggles")
     obs.obs_properties_add_bool(g, PN.NOTIFY_TOGGLE_POPUP, "Popup on capture toggles")
     obs.obs_properties_add_bool(
+        g, PN.NOTIFY_VERBOSE, "Extra status popups (detecting / connecting / closing)"
+    )
+    obs.obs_properties_add_bool(
         g, PN.NOTIFY_CLIP_DISABLED, "Popup when saving with clipping off"
+    )
+    obs.obs_properties_add_text(
+        g,
+        "notify_info",
+        "Status popups need 'Popup on capture toggles' on too. The OBS Script Log has the full detail.",
+        obs.OBS_TEXT_INFO,
     )
 
 
@@ -2087,6 +2286,8 @@ def setup_sounds_group(g):
         g, PN.VOLUME_OFFSET_DB, "Volume offset (dB)", -40.0, 12.0, 0.5
     )
     for toast_key, spec in TOASTS.items():
+        if toast_key in STATUS_TOAST_KEYS:
+            continue
         default_path = get_script_dir() / "sounds" / SOUND_DEFAULT_FILES[toast_key]
         obs.obs_properties_add_path(
             g,
@@ -2196,6 +2397,7 @@ def script_defaults(s):
     obs.obs_data_set_default_bool(s, PN.NOTIFY_CLIP_POPUP, True)
     obs.obs_data_set_default_bool(s, PN.NOTIFY_TOGGLE_SOUND, True)
     obs.obs_data_set_default_bool(s, PN.NOTIFY_TOGGLE_POPUP, True)
+    obs.obs_data_set_default_bool(s, PN.NOTIFY_VERBOSE, True)
     obs.obs_data_set_default_bool(s, PN.NOTIFY_CLIP_DISABLED, False)
     obs.obs_data_set_default_string(s, PN.POPUP_VPOS, "top")
     obs.obs_data_set_default_string(s, PN.POPUP_HPOS, "right")
@@ -2208,6 +2410,8 @@ def script_defaults(s):
     obs.obs_data_set_default_int(s, PN.POPUP_SLIDE_OUT_MS, 150)
     obs.obs_data_set_default_double(s, PN.VOLUME_OFFSET_DB, 0.0)
     for toast_key in TOASTS:
+        if toast_key in STATUS_TOAST_KEYS:
+            continue
         default_path = get_script_dir() / "sounds" / SOUND_DEFAULT_FILES[toast_key]
         obs.obs_data_set_default_string(
             s, sound_setting_name(toast_key), str(default_path)
@@ -2265,6 +2469,7 @@ def script_save(settings):
 
 def script_load(settings):
     VARIABLES.script_settings = settings
+    _print(f"Clip Manager v{SCRIPT_VERSION} loading")
     load_aliases(json.loads(obs.obs_data_get_json(settings)))
     load_auto_buffer_exceptions(settings)
 

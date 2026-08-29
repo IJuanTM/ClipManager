@@ -1,0 +1,71 @@
+name: Release
+
+# Publishes a GitHub Release with a ready-to-use ClipManager-v<version>.zip
+# whenever SCRIPT_VERSION in clip_manager.py names a version that has no release yet.
+# Bump SCRIPT_VERSION, commit, push to master - the release builds itself.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - clip_manager.py
+      - icons/**
+      - sounds/**
+      - README.md
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: v
+        run: |
+          version=$(grep -oP 'SCRIPT_VERSION\s*=\s*"\K[0-9]+\.[0-9]+\.[0-9]+' clip_manager.py)
+          if [ -z "$version" ]; then
+            echo "::error::could not parse SCRIPT_VERSION from clip_manager.py"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Version: $version"
+
+      - name: Check for existing release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.v.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${{ steps.v.outputs.tag }} already exists - nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build zip
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          set -eu
+          zip_name="ClipManager-${{ steps.v.outputs.tag }}.zip"
+          mkdir ClipManager
+          cp clip_manager.py README.md ClipManager/
+          cp -r icons sounds ClipManager/
+          zip -r "$zip_name" ClipManager
+          echo "ZIP_NAME=$zip_name" >> "$GITHUB_ENV"
+          unzip -l "$zip_name"
+
+      - name: Create release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.v.outputs.tag }}" "$ZIP_NAME" \
+            --target "${{ github.sha }}" \
+            --title "${{ steps.v.outputs.tag }}" \
+            --generate-notes
