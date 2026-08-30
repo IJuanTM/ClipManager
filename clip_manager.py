@@ -57,7 +57,7 @@ TOASTS = {
     "game_failed": {
         "icon": "failure",
         "self_contained": True,
-        "text": "No game to capture",
+        "text": "Capture failed",
     },
     "game_detecting": {
         "icon": "info",
@@ -147,7 +147,7 @@ TOAST_HOLD_SECONDS = 2.0
 TOAST_MAX_SLOTS = 8
 STATE_POLL_SECONDS = 0.1
 TOAST_MUTEX_NAME = "Local\\ClipManagerToastStateMutex"
-SCRIPT_VERSION = "0.4.9"
+SCRIPT_VERSION = "0.4.11"
 
 FONT_CANDIDATES = [
     r"C:\Windows\Fonts\segoeuib.ttf",
@@ -541,7 +541,6 @@ if __name__ == "__main__":
         user32.ReleaseDC(None, hdc_screen)
 
     def create_layered_window(img, x, y):
-        hInstance = kernel32.GetModuleHandleW(None)
         hwnd = user32.CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             "STATIC",
@@ -553,7 +552,7 @@ if __name__ == "__main__":
             img.height,
             None,
             None,
-            hInstance,
+            kernel32.GetModuleHandleW(None),
             None,
         )
         if not hwnd:
@@ -661,7 +660,9 @@ if __name__ == "__main__":
             state = prune_dead_entries(read_state())
             existing = state.get(kind)
             if existing:
-                push_bitmap(existing["hwnd"], img, existing["x"], existing["y"])
+                # target_x is recomputed from this toast's width; the stored one was for the previous text and would mis-place a wider/narrower repeat.
+                existing["x"] = target_x
+                push_bitmap(existing["hwnd"], img, target_x, existing["y"])
                 existing["last_update"] = time.time()
                 state[kind] = existing
                 write_state(state)
@@ -817,6 +818,7 @@ class PN:
     DESKTOP_SOURCE_NAME = "desktop_source_name"
     MIC_SOURCE_NAME = "mic_source_name"
     DISPLAY_CLIP_FOLDER = "display_clip_folder"
+    UNKNOWN_CLIP_FOLDER = "unknown_clip_folder"
 
     VOLUME_OFFSET_DB = "volume_offset_db"
 
@@ -1026,19 +1028,24 @@ def sound_setting_name(toast_key: str) -> str:
     return f"sound_{toast_key}"
 
 
+def default_sound_path(toast_key: str) -> Path:
+    return get_script_dir() / "sounds" / SOUND_DEFAULT_FILES.get(toast_key, "")
+
+
 def get_sound_path(toast_key: str) -> str:
     s = VARIABLES.script_settings
     custom = obs.obs_data_get_string(s, sound_setting_name(toast_key)) if s else ""
     if custom:
         return custom
-    default_name = SOUND_DEFAULT_FILES.get(toast_key, "")
-    return str(get_script_dir() / "sounds" / default_name) if default_name else ""
+    return (
+        str(default_sound_path(toast_key)) if SOUND_DEFAULT_FILES.get(toast_key) else ""
+    )
 
 
 def play_notification_sound(toast_key: str):
     if not VARIABLES.script_settings:
         return
-    db_offset = obs.obs_data_get_double(VARIABLES.script_settings, PN.VOLUME_OFFSET_DB)
+    db_offset = _setting_double(PN.VOLUME_OFFSET_DB)
     play_sound_with_gain(get_sound_path(toast_key), db_offset)
 
 
@@ -1053,25 +1060,26 @@ def get_pythonw_path() -> str:
     return os.path.join(base, "pythonw.exe")
 
 
-def show_popup(kind: str, toast_key: str, text_override: str = "", hold: float = 0.0):
+def show_popup(toast_key: str, kind: str, text_override: str = "", hold: float = 0.0):
     pythonw = get_pythonw_path()
     if not pythonw:
         return
-    s = VARIABLES.script_settings
     cfg = {
-        "vpos": obs.obs_data_get_string(s, PN.POPUP_VPOS) or "top",
-        "hpos": obs.obs_data_get_string(s, PN.POPUP_HPOS) or "right",
-        "scale": obs.obs_data_get_double(s, PN.POPUP_SCALE),
-        "height_override": obs.obs_data_get_int(s, PN.POPUP_HEIGHT_OVERRIDE),
-        "edge_margin": obs.obs_data_get_int(s, PN.POPUP_EDGE_MARGIN),
-        "stack_gap": obs.obs_data_get_int(s, PN.POPUP_STACK_GAP),
-        "hold_seconds": hold or obs.obs_data_get_double(s, PN.POPUP_HOLD_SECONDS),
-        "slide_in_ms": obs.obs_data_get_int(s, PN.POPUP_SLIDE_IN_MS),
-        "slide_out_ms": obs.obs_data_get_int(s, PN.POPUP_SLIDE_OUT_MS),
+        "vpos": _setting_str(PN.POPUP_VPOS) or "top",
+        "hpos": _setting_str(PN.POPUP_HPOS) or "right",
+        "scale": _setting_double(PN.POPUP_SCALE),
+        "height_override": _setting_int(PN.POPUP_HEIGHT_OVERRIDE),
+        "edge_margin": _setting_int(PN.POPUP_EDGE_MARGIN),
+        "stack_gap": _setting_int(PN.POPUP_STACK_GAP),
+        "hold_seconds": hold or _setting_double(PN.POPUP_HOLD_SECONDS),
+        "slide_in_ms": _setting_int(PN.POPUP_SLIDE_IN_MS),
+        "slide_out_ms": _setting_int(PN.POPUP_SLIDE_OUT_MS),
         "text_override": text_override,
     }
+    # Strip OBS's PYTHONHOME/PYTHONPATH (aimed at its embedded interpreter); inherited, they make the spawned pythonw.exe fail to find its own stdlib.
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONHOME", "PYTHONPATH")}
     try:
-        subprocess.Popen([pythonw, __file__, kind, toast_key, json.dumps(cfg)])
+        subprocess.Popen([pythonw, __file__, kind, toast_key, json.dumps(cfg)], env=env)
     except Exception:
         _print(traceback.format_exc())
 
@@ -1177,20 +1185,39 @@ def get_alias(executable_path: Path) -> str | None:
 
 
 # -------------------- auto buffer (fullscreen detection + desktop capture link) --------------------
+# One bare exe name per browser covers every channel (stable/beta/dev/canary/nightly) - on Windows they differ by install folder, not binary name - via the bare-name match in is_exe_excepted. Screen-snip overlays span the primary monitor without being maximized.
+DEFAULT_AUTO_BUFFER_EXCEPTIONS = (
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+    "vivaldi.exe",
+    "explorer.exe",
+    "LockApp.exe",
+    "SnippingTool.exe",
+    "ScreenClippingHost.exe",
+    "ScreenSketch.exe",
+    "vlc.exe",
+    "mpv.exe",
+    "mpc-hc64.exe",
+    "mpc-hc.exe",
+    "PotPlayerMini64.exe",
+)
+DEFAULT_AUTO_BUFFER_EXCEPTIONS_TEXT = "\n".join(DEFAULT_AUTO_BUFFER_EXCEPTIONS)
+
+
 def load_auto_buffer_exceptions(settings):
-    # Typed array accessor, not a JSON round-trip like load_aliases - a default-only (never explicitly saved) value may not appear via obs_data_get_json, and this is the one list here that ships with a non-empty default.
-    if settings is None:
-        return
-    names = set()
-    arr = obs.obs_data_get_array(settings, PN.AUTO_BUFFER_EXCEPTIONS)
-    for i in range(obs.obs_data_array_count(arr)):
-        item = obs.obs_data_array_item(arr, i)
-        value = (obs.obs_data_get_string(item, "value") or "").strip().lower()
-        if value:
-            names.add(value)
-        obs.obs_data_release(item)
-    obs.obs_data_array_release(arr)
-    VARIABLES.auto_buffer_exceptions = names
+    # Plain multiline string, never an obs_data_array: OBS AV'd rendering the old editable-list's default array on every script reload (frontend-tools RefreshProperties -> AddEditableList).
+    raw = (
+        obs.obs_data_get_string(settings, PN.AUTO_BUFFER_EXCEPTIONS)
+        if settings is not None
+        else ""
+    ) or DEFAULT_AUTO_BUFFER_EXCEPTIONS_TEXT
+    lines = (line.strip() for line in raw.splitlines())
+    VARIABLES.auto_buffer_exceptions = {
+        line.lower() for line in lines if line and not line.startswith("#")
+    }
 
 
 def is_exe_excepted(exe_path: Path) -> bool:
@@ -1241,6 +1268,18 @@ def is_foreground_window_fullscreen() -> tuple[bool, int]:
 # -------------------- capture state machine --------------------
 def _setting_str(key: str) -> str:
     return obs.obs_data_get_string(VARIABLES.script_settings, key)
+
+
+def _setting_bool(key: str) -> bool:
+    return obs.obs_data_get_bool(VARIABLES.script_settings, key)
+
+
+def _setting_int(key: str) -> int:
+    return obs.obs_data_get_int(VARIABLES.script_settings, key)
+
+
+def _setting_double(key: str) -> float:
+    return obs.obs_data_get_double(VARIABLES.script_settings, key)
 
 
 def source_width(name: str) -> int:
@@ -1404,7 +1443,7 @@ def reap_dead_games():
 
 
 def grace_seconds() -> int:
-    v = obs.obs_data_get_int(VARIABLES.script_settings, PN.GAME_EXIT_GRACE_S)
+    v = _setting_int(PN.GAME_EXIT_GRACE_S)
     return v if v >= 0 else 30
 
 
@@ -1577,7 +1616,7 @@ def finish_game_hook(pid: int, hooked: bool):
             "'Capture any fullscreen application'"
         )
     notify("game_failed", "game", f"Couldn't capture {label}")
-    if obs.obs_data_get_bool(VARIABLES.script_settings, PN.AUTO_SWITCH_ON_HOOK_FAIL):
+    if _setting_bool(PN.AUTO_SWITCH_ON_HOOK_FAIL):
         _print(
             "[hook] 'Fall back to desktop on fail' is on; switching to display capture"
         )
@@ -1653,7 +1692,7 @@ def game_poll_callback():
         resolve_pending_hook()
         if VARIABLES.display_override:
             check_display_override_timeout()
-        elif obs.obs_data_get_bool(VARIABLES.script_settings, PN.AUTO_GAME_CLIPPING):
+        elif _setting_bool(PN.AUTO_GAME_CLIPPING):
             detect_new_game()
         maybe_stop_after_grace()
         reconcile_buffer()
@@ -1663,17 +1702,16 @@ def game_poll_callback():
 
 def setup_game_poll_timer():
     obs.timer_remove(game_poll_callback)
-    interval = obs.obs_data_get_int(VARIABLES.script_settings, PN.GAME_POLL_MS) or 3000
+    interval = _setting_int(PN.GAME_POLL_MS) or 3000
     obs.timer_add(game_poll_callback, interval)
 
 
 # -------------------- sanity checks + disk warning --------------------
 def run_sanity_checks():
-    s = VARIABLES.script_settings
-    game = obs.obs_data_get_string(s, PN.GAME_SOURCE_NAME)
-    desktop = obs.obs_data_get_string(s, PN.DESKTOP_SOURCE_NAME)
-    mic = obs.obs_data_get_string(s, PN.MIC_SOURCE_NAME)
-    auto = obs.obs_data_get_bool(s, PN.AUTO_GAME_CLIPPING)
+    game = _setting_str(PN.GAME_SOURCE_NAME)
+    desktop = _setting_str(PN.DESKTOP_SOURCE_NAME)
+    mic = _setting_str(PN.MIC_SOURCE_NAME)
+    auto = _setting_bool(PN.AUTO_GAME_CLIPPING)
 
     if auto and not game:
         warn_once("Auto game clipping is on but no game capture source is set.", "info")
@@ -1717,7 +1755,7 @@ def disk_check_tick():
     # Resolve path + limit on the OBS thread; the walk (can be slow) runs off-thread.
     if time.time() - VARIABLES.last_disk_check < 60:
         return
-    limit_gb = obs.obs_data_get_int(VARIABLES.script_settings, PN.CLIP_FOLDER_WARN_GB)
+    limit_gb = _setting_int(PN.CLIP_FOLDER_WARN_GB)
     if limit_gb <= 0:
         return
     VARIABLES.last_disk_check = time.time()
@@ -1781,9 +1819,7 @@ def game_clipping_toggle():
 
 
 def _reset_override_deadline():
-    mins = obs.obs_data_get_int(
-        VARIABLES.script_settings, PN.DISPLAY_OVERRIDE_AUTOOFF_MIN
-    )
+    mins = _setting_int(PN.DISPLAY_OVERRIDE_AUTOOFF_MIN)
     VARIABLES.display_override_deadline = time.time() + mins * 60 if mins > 0 else 0.0
 
 
@@ -1842,7 +1878,8 @@ def gen_clip_base_name() -> str:
         with suppress(Exception):
             exe_path = get_executable_path(get_active_window_pid())
     if exe_path is None:
-        return "Unknown"  # elevated / protected process we could never resolve
+        # elevated / protected process we could never resolve
+        return _setting_str(PN.UNKNOWN_CLIP_FOLDER) or "Unknown"
     return get_alias(exe_path) or exe_path.stem
 
 
@@ -1867,15 +1904,17 @@ def ensure_unique_filename(file_path: Path) -> Path:
 
 def move_clip_file() -> Path:
     old_path = get_last_replay_file_name()
+    if not old_path:
+        raise RuntimeError("Replay buffer reported no saved file.")
     if VARIABLES.display_override and not VARIABLES.linked_games:
         clip_name = _setting_str(PN.DISPLAY_CLIP_FOLDER) or "Desktop"
     else:
         clip_name = gen_clip_base_name()
 
-    template = obs.obs_data_get_string(VARIABLES.script_settings, PN.FILENAME_TEMPLATE)
-    filename = gen_filename(clip_name, template) + f".{old_path.split('.')[-1]}"
+    template = _setting_str(PN.FILENAME_TEMPLATE)
+    filename = gen_filename(clip_name, template) + Path(old_path).suffix
     clip_name_folder = clip_name
-    if obs.obs_data_get_bool(VARIABLES.script_settings, PN.REPLACE_SPACES):
+    if _setting_bool(PN.REPLACE_SPACES):
         filename = filename.replace(" ", "_")
         clip_name_folder = clip_name_folder.replace(" ", "_")
     if clip_name_folder in (".", "..") or any(
@@ -1896,10 +1935,10 @@ def move_clip_file() -> Path:
 def notify_clip(success: bool):
     with suppress(Exception):
         toast_key = "replay_saved" if success else "replay_failed"
-        if obs.obs_data_get_bool(VARIABLES.script_settings, PN.NOTIFY_CLIP_SOUND):
+        if _setting_bool(PN.NOTIFY_CLIP_SOUND):
             play_notification_sound(toast_key)
-        if obs.obs_data_get_bool(VARIABLES.script_settings, PN.NOTIFY_CLIP_POPUP):
-            show_popup("replay", toast_key)
+        if _setting_bool(PN.NOTIFY_CLIP_POPUP):
+            show_popup(toast_key, "replay")
 
 
 def notify(
@@ -1910,26 +1949,26 @@ def notify(
     silent: bool = False,
 ):
     with suppress(Exception):
-        if not silent and obs.obs_data_get_bool(
-            VARIABLES.script_settings, PN.NOTIFY_TOGGLE_SOUND
-        ):
+        if not silent and _setting_bool(PN.NOTIFY_TOGGLE_SOUND):
             play_notification_sound(toast_key)
-        if obs.obs_data_get_bool(VARIABLES.script_settings, PN.NOTIFY_TOGGLE_POPUP):
-            show_popup(kind, toast_key, text_override, hold)
+        if _setting_bool(PN.NOTIFY_TOGGLE_POPUP):
+            show_popup(toast_key, kind, text_override, hold)
 
 
 def notify_status(toast_key: str, text_override: str = "", hold: float = 0.0):
     # Intermediate "still working" popups - silent, verbose-gated, and on their own popup slot so they never overwrite a real capture / warning toast.
     with suppress(Exception):
-        if obs.obs_data_get_bool(VARIABLES.script_settings, PN.NOTIFY_VERBOSE):
+        if _setting_bool(PN.NOTIFY_VERBOSE):
             notify(toast_key, "status", text_override, hold, silent=True)
 
 
 # -------------------- replay buffer save flow --------------------
 def restart_replay_buffering():
-    _print("[buffer] restarting replay buffering (periodic / post-save refresh)")
     with VARIABLES.buffer_restart_lock:
+        if VARIABLES.buffer_restart_depth > 0:
+            return  # a restart is already cycling the buffer; it ends with the buffer running
         VARIABLES.buffer_restart_depth += 1
+    _print("[buffer] restarting replay buffering (periodic / post-save refresh)")
     try:
         replay_output = obs.obs_frontend_get_replay_buffer_output()
         obs.obs_frontend_replay_buffer_stop()
@@ -1943,6 +1982,7 @@ def restart_replay_buffering():
                 time.sleep(0.1)
             obs.obs_output_release(replay_output)
         obs.obs_frontend_replay_buffer_start()
+        VARIABLES.buffer_start_at = time.time()
     finally:
         with VARIABLES.buffer_restart_lock:
             VARIABLES.buffer_restart_depth -= 1
@@ -1974,13 +2014,13 @@ def on_buffer_save_callback(event):
     # game_empty_since keeps clips saving through the exit-grace window, where capture_target() is already "off" but the user still wants the last play.
     if capture_target() == "off" and not VARIABLES.game_empty_since:
         _print("Replay saved while clipping is disabled; leaving the clip untouched.")
-        if obs.obs_data_get_bool(VARIABLES.script_settings, PN.NOTIFY_CLIP_DISABLED):
+        if _setting_bool(PN.NOTIFY_CLIP_DISABLED):
             show_popup("info", "info", "Clipping is disabled")
         return
     _print("Replay buffer saved, moving clip...")
     try:
         move_clip_file()
-        if obs.obs_data_get_bool(VARIABLES.script_settings, PN.RESTART_BUFFER):
+        if _setting_bool(PN.RESTART_BUFFER):
             Thread(target=restart_replay_buffering, daemon=True).start()
         if VARIABLES.display_override:
             _reset_override_deadline()
@@ -2000,9 +2040,7 @@ def on_buffer_started_callback(event):
     )  # this event also fires from the restart cycle
     obs.timer_remove(restart_replay_buffering_callback)
     obs.timer_add(append_clip_exe_history, 1000)
-    if loop_time := obs.obs_data_get_int(
-        VARIABLES.script_settings, PN.RESTART_BUFFER_LOOP
-    ):
+    if loop_time := _setting_int(PN.RESTART_BUFFER_LOOP):
         obs.timer_add(restart_replay_buffering_callback, loop_time * 1000)
 
 
@@ -2024,7 +2062,7 @@ def on_mic_mute_signal(calldata):
 
 def get_mic_source():
     # Caller owns the ref and must obs_source_release it (unless keeping it deliberately, as connect_mic_signal does).
-    name = obs.obs_data_get_string(VARIABLES.script_settings, PN.MIC_SOURCE_NAME)
+    name = _setting_str(PN.MIC_SOURCE_NAME)
     return obs.obs_get_source_by_name(name) if name else None
 
 
@@ -2042,7 +2080,7 @@ def disconnect_mic_signal():
 
 
 def connect_mic_signal():
-    name = obs.obs_data_get_string(VARIABLES.script_settings, PN.MIC_SOURCE_NAME)
+    name = _setting_str(PN.MIC_SOURCE_NAME)
     source = obs.obs_get_source_by_name(name) if name else None
     if name and not source:
         # Don't tear down a working connection just because the source is briefly unresolvable.
@@ -2061,12 +2099,16 @@ def connect_mic_signal():
     _print(f"[mic] mute signal connected to '{name}'")
 
 
-def on_frontend_ready_callback(event):
-    # script_load can run before the scene collection (and the sources) exist.
-    if event == obs.OBS_FRONTEND_EVENT_FINISHED_LOADING:
+def on_frontend_event_callback(event):
+    # Both events can leave the mic signal bound to a source that doesn't exist yet (load) or no longer exists (collection swap).
+    if event in (
+        obs.OBS_FRONTEND_EVENT_FINISHED_LOADING,
+        obs.OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED,
+    ):
         connect_mic_signal()
         run_sanity_checks()
-        disk_check_tick()
+        if event == obs.OBS_FRONTEND_EVENT_FINISHED_LOADING:
+            disk_check_tick()
 
 
 # -------------------- hotkeys --------------------
@@ -2198,6 +2240,9 @@ def setup_paths_group(g):
     obs.obs_properties_add_text(
         g, PN.DISPLAY_CLIP_FOLDER, "Desktop clips subfolder", obs.OBS_TEXT_DEFAULT
     )
+    obs.obs_properties_add_text(
+        g, PN.UNKNOWN_CLIP_FOLDER, "Unresolved-game subfolder", obs.OBS_TEXT_DEFAULT
+    )
     obs.obs_properties_add_bool(g, PN.REPLACE_SPACES, "Spaces to underscores")
     obs.obs_properties_add_int(
         g, PN.CLIP_FOLDER_WARN_GB, "Warn over folder size (GB, 0 = off)", 0, 10000, 10
@@ -2288,14 +2333,13 @@ def setup_sounds_group(g):
     for toast_key, spec in TOASTS.items():
         if toast_key in STATUS_TOAST_KEYS:
             continue
-        default_path = get_script_dir() / "sounds" / SOUND_DEFAULT_FILES[toast_key]
         obs.obs_properties_add_path(
             g,
             sound_setting_name(toast_key),
             spec["text"],
             obs.OBS_PATH_FILE,
             "WAV (*.wav)",
-            str(default_path),
+            str(default_sound_path(toast_key)),
         )
 
 
@@ -2332,16 +2376,12 @@ def setup_capture_group(g):
     obs.obs_properties_add_text(
         g,
         "exceptions_info",
-        "Exceptions: exe name or folder path, one per line.",
+        "Fullscreen apps to ignore: exe name or folder path, one per line ('#' starts a "
+        "comment). Pre-filled with browsers and media players; edit freely.",
         obs.OBS_TEXT_INFO,
     )
-    exceptions_list = obs.obs_properties_add_editable_list(
-        g,
-        PN.AUTO_BUFFER_EXCEPTIONS,
-        "Exceptions",
-        obs.OBS_EDITABLE_LIST_TYPE_STRINGS,
-        None,
-        None,
+    exceptions_list = obs.obs_properties_add_text(
+        g, PN.AUTO_BUFFER_EXCEPTIONS, "Exceptions", obs.OBS_TEXT_MULTILINE
     )
     obs.obs_property_set_modified_callback(poll_prop, update_game_poll_timer_callback)
     obs.obs_property_set_modified_callback(
@@ -2392,6 +2432,7 @@ def script_defaults(s):
     )
     obs.obs_data_set_default_bool(s, PN.REPLACE_SPACES, True)
     obs.obs_data_set_default_string(s, PN.DISPLAY_CLIP_FOLDER, "Desktop")
+    obs.obs_data_set_default_string(s, PN.UNKNOWN_CLIP_FOLDER, "Unknown")
     obs.obs_data_set_default_int(s, PN.CLIP_FOLDER_WARN_GB, 100)
     obs.obs_data_set_default_bool(s, PN.NOTIFY_CLIP_SOUND, True)
     obs.obs_data_set_default_bool(s, PN.NOTIFY_CLIP_POPUP, True)
@@ -2412,9 +2453,8 @@ def script_defaults(s):
     for toast_key in TOASTS:
         if toast_key in STATUS_TOAST_KEYS:
             continue
-        default_path = get_script_dir() / "sounds" / SOUND_DEFAULT_FILES[toast_key]
         obs.obs_data_set_default_string(
-            s, sound_setting_name(toast_key), str(default_path)
+            s, sound_setting_name(toast_key), str(default_sound_path(toast_key))
         )
     obs.obs_data_set_default_bool(s, PN.RESTART_BUFFER, False)
     obs.obs_data_set_default_int(s, PN.RESTART_BUFFER_LOOP, 3600)
@@ -2423,37 +2463,9 @@ def script_defaults(s):
     obs.obs_data_set_default_int(s, PN.GAME_EXIT_GRACE_S, 30)
     obs.obs_data_set_default_bool(s, PN.AUTO_SWITCH_ON_HOOK_FAIL, True)
     obs.obs_data_set_default_int(s, PN.DISPLAY_OVERRIDE_AUTOOFF_MIN, 60)
-    default_exceptions = obs.obs_data_array_create()
-    # One bare exe name per browser covers every channel (stable/beta/dev/canary/nightly) - on Windows they differ by install folder, not binary name - via the bare-name match in is_exe_excepted.
-    browser_exes = (
-        "chrome.exe",
-        "msedge.exe",
-        "firefox.exe",
-        "brave.exe",
-        "opera.exe",
-        "vivaldi.exe",
+    obs.obs_data_set_default_string(
+        s, PN.AUTO_BUFFER_EXCEPTIONS, DEFAULT_AUTO_BUFFER_EXCEPTIONS_TEXT
     )
-    non_game_fullscreen_exes = (
-        "explorer.exe",
-        "LockApp.exe",
-        # Screen-snip overlays span the primary monitor without being maximized.
-        "SnippingTool.exe",
-        "ScreenClippingHost.exe",
-        "ScreenSketch.exe",
-        "vlc.exe",
-        "mpv.exe",
-        "mpc-hc64.exe",
-        "mpc-hc.exe",
-        "PotPlayerMini64.exe",
-    )
-    for exe_name in browser_exes + non_game_fullscreen_exes:
-        item = obs.obs_data_create_from_json(
-            json.dumps({"hidden": False, "selected": False, "value": exe_name})
-        )
-        obs.obs_data_array_push_back(default_exceptions, item)
-        obs.obs_data_release(item)
-    obs.obs_data_set_default_array(s, PN.AUTO_BUFFER_EXCEPTIONS, default_exceptions)
-    obs.obs_data_array_release(default_exceptions)
 
 
 def script_update(settings):
@@ -2480,7 +2492,7 @@ def script_load(settings):
     obs.obs_frontend_add_event_callback(on_buffer_save_callback)
     obs.obs_frontend_add_event_callback(on_buffer_started_callback)
     obs.obs_frontend_add_event_callback(on_buffer_stopped_callback)
-    obs.obs_frontend_add_event_callback(on_frontend_ready_callback)
+    obs.obs_frontend_add_event_callback(on_frontend_event_callback)
     load_hotkeys()
 
     connect_mic_signal()
@@ -2502,7 +2514,7 @@ def script_unload():
     obs.obs_frontend_remove_event_callback(on_buffer_save_callback)
     obs.obs_frontend_remove_event_callback(on_buffer_started_callback)
     obs.obs_frontend_remove_event_callback(on_buffer_stopped_callback)
-    obs.obs_frontend_remove_event_callback(on_frontend_ready_callback)
+    obs.obs_frontend_remove_event_callback(on_frontend_event_callback)
     for hotkey_id in VARIABLES.hotkey_ids.values():
         obs.obs_hotkey_unregister(hotkey_id)
     VARIABLES.hotkey_ids = {}
