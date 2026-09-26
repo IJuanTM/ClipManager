@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     def script_path() -> str: ...
 
 
-SCRIPT_VERSION = "1.0.1"
+SCRIPT_VERSION = "1.0.2"
 
 
 # -------------------- toast popup (runs as a separate process) --------------------
@@ -1018,7 +1018,10 @@ def play_sound_with_gain(path: str, db_offset: float):
     # SND_ASYNC returns immediately, so delete only after playback would have finished.
     Thread(
         target=_delete_after_delay,
-        args=(tmp_path, (params.nframes / params.framerate if params.framerate else 10) + 2),
+        args=(
+            tmp_path,
+            (params.nframes / params.framerate if params.framerate else 10) + 2,
+        ),
         daemon=True,
     ).start()
 
@@ -1050,7 +1053,9 @@ def get_sound_path(toast_key: str) -> str:
 def play_notification_sound(toast_key: str):
     if not VARIABLES.script_settings:
         return
-    play_sound_with_gain(get_sound_path(toast_key), _setting_double(PN.VOLUME_OFFSET_DB))
+    play_sound_with_gain(
+        get_sound_path(toast_key), _setting_double(PN.VOLUME_OFFSET_DB)
+    )
 
 
 def get_pythonw_path() -> str:
@@ -1084,7 +1089,11 @@ def show_popup(toast_key: str, kind: str, text_override: str = "", hold: float =
     try:
         subprocess.Popen(
             [pythonw, __file__, kind, toast_key, json.dumps(cfg)],
-            env={k: v for k, v in os.environ.items() if k not in ("PYTHONHOME", "PYTHONPATH")},
+            env={
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("PYTHONHOME", "PYTHONPATH")
+            },
         )
     except Exception:
         _print(traceback.format_exc())
@@ -1969,9 +1978,10 @@ def move_clip_file() -> Path:
     else:
         clip_name = gen_clip_base_name()
 
-    filename = gen_filename(clip_name, _setting_str(PN.FILENAME_TEMPLATE)) + Path(
-        old_path
-    ).suffix
+    filename = (
+        gen_filename(clip_name, _setting_str(PN.FILENAME_TEMPLATE))
+        + Path(old_path).suffix
+    )
     clip_name_folder = clip_name
     if _setting_bool(PN.REPLACE_SPACES):
         filename = filename.replace(" ", "_")
@@ -2101,8 +2111,13 @@ def on_buffer_started_callback(event):
     obs.timer_add(append_clip_exe_history, 1000)
     VARIABLES.restart_loop_s = _setting_int(PN.RESTART_BUFFER_LOOP)
     if VARIABLES.restart_loop_s:
-        obs.timer_add(restart_replay_buffering_callback, VARIABLES.restart_loop_s * 1000)
-    from_restart, VARIABLES.restart_start_pending = VARIABLES.restart_start_pending, False
+        obs.timer_add(
+            restart_replay_buffering_callback, VARIABLES.restart_loop_s * 1000
+        )
+    from_restart, VARIABLES.restart_start_pending = (
+        VARIABLES.restart_start_pending,
+        False,
+    )
     # Not warn_once: a missing device means every clip from this buffer is silent or blank, so repeat it each time capture starts.
     if not from_restart and (msg := missing_device_message()):
         notify("warning", "warning", msg, hold=8.0)
