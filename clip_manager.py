@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     def script_path() -> str: ...
 
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 
 
 # -------------------- toast popup (runs as a separate process) --------------------
@@ -145,7 +145,7 @@ GLYPH_ICON_SCALE = 1.1
 ICON_Y_OFFSET_SRC_PX = {"display-capture-on": 12.5, "display-capture-off": 12.5}
 ICON_Y_NUDGE_PX = 1
 TOAST_HOLD_SECONDS = 2.0
-TOAST_MAX_SLOTS = 8
+TOAST_MAX_SLOTS = 9  # must be >= the distinct toast kinds passed to notify()/show_popup(), one state slot each
 STATE_POLL_SECONDS = 0.1
 TOAST_MUTEX_NAME = "Local\\ClipManagerToastStateMutex"
 
