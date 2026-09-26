@@ -12,7 +12,7 @@ import traceback
 import wave
 import winsound
 from collections import Counter, deque
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
@@ -147,7 +147,7 @@ TOAST_HOLD_SECONDS = 2.0
 TOAST_MAX_SLOTS = 8
 STATE_POLL_SECONDS = 0.1
 TOAST_MUTEX_NAME = "Local\\ClipManagerToastStateMutex"
-SCRIPT_VERSION = "0.4.11"
+SCRIPT_VERSION = "0.4.13"
 
 FONT_CANDIDATES = [
     r"C:\Windows\Fonts\segoeuib.ttf",
@@ -498,9 +498,8 @@ if __name__ == "__main__":
         bmi = BITMAPINFO()
         bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
         bmi.bmiHeader.biWidth = img.width
-        bmi.bmiHeader.biHeight = (
-            -img.height
-        )  # negative = top-down, matches PIL's row order
+        # Negative = top-down, matching PIL's row order.
+        bmi.bmiHeader.biHeight = -img.height
         bmi.bmiHeader.biPlanes = 1
         bmi.bmiHeader.biBitCount = 32
         bmi.bmiHeader.biCompression = BI_RGB
@@ -775,27 +774,21 @@ class VARIABLES:
     # One in-flight hook at a time, so its retry count is two scalars, not a pid map.
     hook_retry_pid = 0
     hook_retry_count = 0
-    detect_note = (
-        ""  # last [detect] line printed, so the per-poll scan doesn't spam the log
-    )
-    game_hook_source = (
-        None  # held source ref for the "hooked" signal; released in end_pending_hook
-    )
+    # Last [detect] line printed, so the per-poll scan doesn't spam the log.
+    detect_note = ""
+    # Held source ref for the "hooked" signal; released in end_pending_hook.
+    game_hook_source = None
     display_override = False
     display_override_deadline = 0.0
-    sanity_warned: set = (
-        set()
-    )  # messages already surfaced this session, to avoid re-nagging
-    disk_over_limit = (
-        False  # latch so the folder-size warning fires once per threshold crossing
-    )
-    disk_warn_msg = (
-        ""  # set by the walk thread, surfaced (and cleared) on the OBS thread
-    )
+    # Messages already surfaced this session, to avoid re-nagging.
+    sanity_warned: set = set()
+    # Latch so the folder-size warning fires once per threshold crossing.
+    disk_over_limit = False
+    # Set by the walk thread, surfaced (and cleared) on the OBS thread.
+    disk_warn_msg = ""
     last_disk_check = 0.0
-    buffer_start_at = (
-        0.0  # last replay_buffer_start() call, so reconcile_buffer waits it out
-    )
+    # Last replay_buffer_start() call, so reconcile_buffer waits it out.
+    buffer_start_at = 0.0
 
 
 class PN:
@@ -1253,14 +1246,11 @@ def is_foreground_window_fullscreen() -> tuple[bool, int]:
     if not user32_win.GetWindowRect(hwnd, ctypes.byref(rect)):
         return False, pid.value
     # Primary monitor only, not wherever the window happens to be - GetSystemMetrics(0/1) is the primary monitor's size with its top-left always at the desktop origin (0,0).
-    primary_w, primary_h = user32_win.GetSystemMetrics(0), user32_win.GetSystemMetrics(
-        1
-    )
     fullscreen = (
         rect.left <= 0
         and rect.top <= 0
-        and rect.right >= primary_w
-        and rect.bottom >= primary_h
+        and rect.right >= user32_win.GetSystemMetrics(0)
+        and rect.bottom >= user32_win.GetSystemMetrics(1)
     )
     return fullscreen, pid.value
 
@@ -1282,16 +1272,19 @@ def _setting_double(key: str) -> float:
     return obs.obs_data_get_double(VARIABLES.script_settings, key)
 
 
-def source_width(name: str) -> int:
-    if not name:
-        return 0
-    src = obs.obs_get_source_by_name(name)
-    if not src:
-        return 0
+@contextmanager
+def _source_ref(name: str):
+    src = obs.obs_get_source_by_name(name) if name else None
     try:
-        return obs.obs_source_get_width(src)
+        yield src
     finally:
-        obs.obs_source_release(src)
+        if src:
+            obs.obs_source_release(src)
+
+
+def source_width(name: str) -> int:
+    with _source_ref(name) as src:
+        return obs.obs_source_get_width(src) if src else 0
 
 
 def set_scene_source_visible(name: str, visible: bool):
@@ -1309,12 +1302,8 @@ def set_scene_source_visible(name: str, visible: bool):
 
 
 def source_exists(name: str) -> bool:
-    if not name:
-        return False
-    src = obs.obs_get_source_by_name(name)
-    if src:
-        obs.obs_source_release(src)
-    return bool(src)
+    with _source_ref(name) as src:
+        return bool(src)
 
 
 def source_in_current_scene(name: str) -> bool:
@@ -1326,6 +1315,55 @@ def source_in_current_scene(name: str) -> bool:
         return bool(obs.obs_scene_find_source(scene, name))
     finally:
         obs.obs_source_release(scene_source)
+
+
+DEVICE_SETTING_KEYS = {
+    "wasapi_input_capture": "device_id",
+    "wasapi_output_capture": "device_id",
+    "monitor_capture": "monitor_id",
+}
+
+
+def _device_missing(source, key: str) -> bool:
+    settings = obs.obs_source_get_settings(source)
+    current = obs.obs_data_get_string(settings, key)
+    obs.obs_data_release(settings)
+    if not current or current == "default":
+        return False
+    props = obs.obs_source_properties(source)
+    try:
+        prop = obs.obs_properties_get(props, key)
+        if not prop:
+            return False
+        return not any(
+            obs.obs_property_list_item_string(prop, i) == current
+            and not obs.obs_property_list_item_disabled(prop, i)
+            for i in range(obs.obs_property_list_item_count(prop))
+        )
+    finally:
+        obs.obs_properties_destroy(props)
+
+
+def sources_missing_device() -> list:
+    # OBS binds audio/display sources by device ID, and Sonar/driver updates re-create devices under new IDs, silently leaving the source capturing nothing.
+    missing = []
+    sources = obs.obs_enum_sources()
+    try:
+        for src in sources or []:
+            key = DEVICE_SETTING_KEYS.get(obs.obs_source_get_unversioned_id(src))
+            if key and _device_missing(src, key):
+                missing.append(obs.obs_source_get_name(src))
+    finally:
+        obs.source_list_release(sources)
+    return missing
+
+
+def missing_device_message() -> str:
+    missing = sources_missing_device()
+    if not missing:
+        return ""
+    _print(f"[devices] no device found for: {', '.join(missing)}")
+    return f"Device not found for {', '.join(missing)} - reselect it in OBS"
 
 
 def warn_once(msg: str, toast_key: str = "warning"):
@@ -1484,9 +1522,8 @@ def connect_game_hook_signal():
     obs.signal_handler_connect(
         obs.obs_source_get_signal_handler(src), "hooked", on_game_capture_hooked
     )
-    VARIABLES.game_hook_source = (
-        src  # keep the ref (don't release) so the handler outlives this call
-    )
+    # Keep the ref (don't release) so the handler outlives this call.
+    VARIABLES.game_hook_source = src
 
 
 def end_pending_hook():
@@ -1639,9 +1676,8 @@ def detect_new_game():
         return
     fullscreen, pid = is_foreground_window_fullscreen()
     if not (fullscreen and pid):
-        VARIABLES.detect_note = (
-            ""  # foreground isn't a fullscreen game; let the next real event log fresh
-        )
+        # Foreground isn't a fullscreen game; let the next real event log fresh.
+        VARIABLES.detect_note = ""
         return
     # Cheap membership checks first; only resolve the exe name (a syscall) once the pid is actually new.
     if pid in VARIABLES.linked_games:
@@ -1667,12 +1703,12 @@ def detect_new_game():
 
 def reconcile_buffer():
     # Self-heal a buffer that should be running (game linked or override on) but was stopped outside our control - an encoder hiccup, OBS's own restart. Only ever starts it.
+    # The 8 s wait lets a pending start settle first.
     if (
         VARIABLES.buffer_restart_depth == 0
         and capture_target() != "off"
         and not obs.obs_frontend_replay_buffer_active()
-        and time.time() - VARIABLES.buffer_start_at
-        >= 8.0  # let a pending start settle first
+        and time.time() - VARIABLES.buffer_start_at >= 8.0
     ):
         _print("[buffer] replay buffer was down while capture is active; restarting it")
         obs.obs_frontend_replay_buffer_start()
@@ -1724,6 +1760,8 @@ def run_sanity_checks():
             warn_once(f"{label} source '{name}' is not in the current scene.")
     if mic and not source_exists(mic):
         warn_once(f"Mic source '{mic}' not found.")
+    if msg := missing_device_message():
+        warn_once(msg)
 
 
 def _folder_bytes(root: Path) -> int:
@@ -1769,7 +1807,8 @@ def game_clipping_on():
     _print("[hotkey] Game clipping on")
     if VARIABLES.display_override:
         _print("[hotkey] ignored - display override is active; turn that off first")
-        return  # display override outranks game clipping; turn it off first
+        notify("info", "info", "Desktop capture is on - turn it off first")
+        return
     fg = get_active_window_pid()
     if fg in VARIABLES.handled_games:
         _print(f"[hotkey] clearing {_exe_label(fg)} from the dismissed list")
@@ -2035,13 +2074,15 @@ def on_buffer_started_callback(event):
     if event != obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED:
         return
     VARIABLES.clip_exe_history = deque([], maxlen=get_replay_buffer_max_time())
-    obs.timer_remove(
-        append_clip_exe_history
-    )  # this event also fires from the restart cycle
+    # This event also fires from the restart cycle.
+    obs.timer_remove(append_clip_exe_history)
     obs.timer_remove(restart_replay_buffering_callback)
     obs.timer_add(append_clip_exe_history, 1000)
     if loop_time := _setting_int(PN.RESTART_BUFFER_LOOP):
         obs.timer_add(restart_replay_buffering_callback, loop_time * 1000)
+    # Not warn_once: a missing device means every clip from this buffer is silent or blank, so repeat it each time capture starts.
+    if VARIABLES.buffer_restart_depth == 0 and (msg := missing_device_message()):
+        notify("warning", "warning", msg, hold=8.0)
 
 
 def on_buffer_stopped_callback(event):
@@ -2058,12 +2099,6 @@ def on_buffer_stopped_callback(event):
 def on_mic_mute_signal(calldata):
     muted = obs.calldata_bool(calldata, "muted")
     notify("mic_off" if muted else "mic_on", "mic")
-
-
-def get_mic_source():
-    # Caller owns the ref and must obs_source_release it (unless keeping it deliberately, as connect_mic_signal does).
-    name = _setting_str(PN.MIC_SOURCE_NAME)
-    return obs.obs_get_source_by_name(name) if name else None
 
 
 def disconnect_mic_signal():
@@ -2093,9 +2128,8 @@ def connect_mic_signal():
     obs.signal_handler_connect(
         obs.obs_source_get_signal_handler(source), "mute", on_mic_mute_signal
     )
-    VARIABLES.mic_signal_source = (
-        source  # keep the ref so the signal handler can't be freed under us
-    )
+    # Keep the ref so the signal handler can't be freed under us.
+    VARIABLES.mic_signal_source = source
     _print(f"[mic] mute signal connected to '{name}'")
 
 
@@ -2112,30 +2146,31 @@ def on_frontend_event_callback(event):
 
 
 # -------------------- hotkeys --------------------
+def _warn_mic_missing():
+    _print("[mic] mic source is not set or not found")
+    notify("warning", "warning", "Mic source not found")
+
+
 def toggle_mic_mute():
-    source = get_mic_source()
-    if not source:
-        _print("Mic source is not set or not found.")
-        return
-    obs.obs_source_set_muted(source, not obs.obs_source_muted(source))
-    obs.obs_source_release(source)
+    with _source_ref(_setting_str(PN.MIC_SOURCE_NAME)) as source:
+        if not source:
+            return _warn_mic_missing()
+        obs.obs_source_set_muted(source, not obs.obs_source_muted(source))
 
 
 def toggle_mic_monitoring():
-    source = get_mic_source()
-    if not source:
-        _print("Mic source is not set or not found.")
-        return
-    currently_on = (
-        obs.obs_source_get_monitoring_type(source) != obs.OBS_MONITORING_TYPE_NONE
-    )
-    new_type = (
-        obs.OBS_MONITORING_TYPE_NONE
-        if currently_on
-        else obs.OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT
-    )
-    obs.obs_source_set_monitoring_type(source, new_type)
-    obs.obs_source_release(source)
+    with _source_ref(_setting_str(PN.MIC_SOURCE_NAME)) as source:
+        if not source:
+            return _warn_mic_missing()
+        currently_on = (
+            obs.obs_source_get_monitoring_type(source) != obs.OBS_MONITORING_TYPE_NONE
+        )
+        obs.obs_source_set_monitoring_type(
+            source,
+            obs.OBS_MONITORING_TYPE_NONE
+            if currently_on
+            else obs.OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT,
+        )
     # No OBS signal fires for a monitoring-type change (unlike mute), so this notifies directly.
     notify("monitor_off" if currently_on else "monitor_on", "monitor")
 

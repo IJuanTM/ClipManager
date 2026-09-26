@@ -97,7 +97,7 @@ Toasts appear top-right by default and stack downward. One capture change can sh
 | Desktop capture on / off     | Display override engaged or released                                           |
 | Microphone on / off          | Mic source unmuted or muted                                                    |
 | Listening on / off           | Mic monitoring toggled                                                         |
-| Warning / Info               | A misconfiguration, or the folder-size limit was crossed                       |
+| Warning / Info               | A misconfiguration, a source whose device is gone, or the folder-size limit    |
 
 **Status popups** (_Extra status popups_, on by default) add short "still working" toasts — _Game detected_ before the hook, _Connecting_ on a retry, _Game closed_ when the last program exits. They are popup-only and also need _Popup on capture toggles_ on.
 
@@ -121,6 +121,10 @@ Bound in **Settings → Hotkeys** (search _"Clip Manager"_).
 | Toggle mic monitoring   | Turn monitoring ("hearing yourself") on or off                               |
 
 Saving a clip uses OBS's built-in **Save Replay Buffer** hotkey, not one of these.
+
+### Stream Deck
+
+[Clip Manager for Stream Deck](https://github.com/IJuanTM/ClipManagerStreamDeckPlugin) adds keys for these actions that show their current state (game clipping, desktop capture, mic, listening, save replay). It talks to OBS over its built-in WebSocket server, so no hotkey bindings are needed.
 
 ---
 
@@ -209,6 +213,8 @@ Width auto-fits the label; Scale multiplies height and text together.
 - **No popups at all** — Pillow isn't installed in the Python OBS points at, or the OBS Python path (_Tools → Scripts → Python Settings_) is unset. The Script Log says which.
 - **Script won't load** — OBS has to be pointed at **Python 3.10**; 3.12+ fails with _"Could not load library"_.
 - **Clips aren't being sorted** — the replay buffer has to actually be running. With clipping off and the buffer stopped, OBS's Save Replay hotkey does nothing (turn on _Popup when saving with clipping off_ for a reminder).
+- **Clips have no audio, or desktop clips are black** — OBS remembers audio devices and monitors by an internal ID, and driver or audio-software updates (e.g. SteelSeries Sonar) can replace a device with a new ID. The script warns with _Device not found for ..._; re-pick the device in that source's properties.
+- **Stream Deck F13-F24 keys can't be bound** — if OBS runs as administrator, Windows blocks key presses sent by the (non-admin) Stream Deck app to OBS's window. Run OBS normally, or use the Stream Deck plugin above.
 - **Settings reset themselves** — removing and re-adding the script in the Scripts list wipes its config. Overwrite `clip_manager.py` in place and reload instead.
 
 ---
