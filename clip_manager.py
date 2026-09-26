@@ -27,6 +27,9 @@ if TYPE_CHECKING:
     def script_path() -> str: ...
 
 
+SCRIPT_VERSION = "1.0.0"
+
+
 # -------------------- toast popup (runs as a separate process) --------------------
 # Per-pixel alpha via Win32 UpdateLayeredWindow, not tkinter chroma-key, so the shadow can fade out without a fringe.
 TOASTS = {
@@ -140,14 +143,11 @@ SELF_CONTAINED_ICON_SCALE = 2.0
 GLYPH_ICON_SCALE = 1.1
 # Only the "on" (slash-free) variant's bbox is trustworthy for measuring an off-center glyph - the "off" variant's bbox is dominated by its symmetric diagonal slash regardless of where the glyph sits.
 ICON_Y_OFFSET_SRC_PX = {"display-capture-on": 12.5, "display-capture-off": 12.5}
-ICON_Y_NUDGE_PX = (
-    1  # applies to every icon, not just the ones with a measured offset above
-)
+ICON_Y_NUDGE_PX = 1
 TOAST_HOLD_SECONDS = 2.0
 TOAST_MAX_SLOTS = 8
 STATE_POLL_SECONDS = 0.1
 TOAST_MUTEX_NAME = "Local\\ClipManagerToastStateMutex"
-SCRIPT_VERSION = "0.4.13"
 
 FONT_CANDIDATES = [
     r"C:\Windows\Fonts\segoeuib.ttf",
@@ -211,7 +211,6 @@ if __name__ == "__main__":
 
         S = lambda v: round_px(v * ss)
         font = load_font(S(font_size))
-        # Auto-size width to the text, with the right inset matching the badge's left inset.
         tb = ImageDraw.Draw(Image.new("L", (1, 1))).textbbox(
             (0, 0), spec["text"], font=font
         )
@@ -659,11 +658,11 @@ if __name__ == "__main__":
             state = prune_dead_entries(read_state())
             existing = state.get(kind)
             if existing:
-                # target_x is recomputed from this toast's width; the stored one was for the previous text and would mis-place a wider/narrower repeat.
-                existing["x"] = target_x
+                # The owning process animates and times the window, so it needs this toast's x / width / hold, not the ones it was created with.
+                existing.update(
+                    x=target_x, w=img.width, hold=hold_seconds, last_update=time.time()
+                )
                 push_bitmap(existing["hwnd"], img, target_x, existing["y"])
-                existing["last_update"] = time.time()
-                state[kind] = existing
                 write_state(state)
                 hwnd = None
             else:
@@ -684,6 +683,8 @@ if __name__ == "__main__":
                         "hwnd": hwnd,
                         "x": target_x,
                         "y": target_y,
+                        "w": img.width,
+                        "hold": hold_seconds,
                         "slot": slot,
                         "last_update": time.time(),
                     }
@@ -692,7 +693,7 @@ if __name__ == "__main__":
             release_state_lock(mutex)
 
         if not hwnd:
-            return  # reused an existing toast, or the window failed to create - nothing to own
+            return
 
         animate_slide(
             hwnd,
@@ -706,21 +707,25 @@ if __name__ == "__main__":
             duration=slide_in_s,
         )
 
+        x, w = target_x, img.width
         while True:
             time.sleep(STATE_POLL_SECONDS)
             entry = read_state().get(kind)
             # A missing/changed entry means the state file was lost or reassigned; still tear down the window this process owns.
             if not entry or entry.get("hwnd") != hwnd:
                 break
-            if time.time() - entry["last_update"] >= hold_seconds:
+            if (entry["x"], entry["w"]) != (x, w):
+                x, w = entry["x"], entry["w"]
+                move_window(hwnd, x, target_y, w, img.height, screen_w, screen_h)
+            if time.time() - entry["last_update"] >= entry["hold"]:
                 break
 
         animate_slide(
             hwnd,
-            target_x,
-            start_x,
+            x,
+            -w if hpos == "left" else screen_w,
             target_y,
-            img.width,
+            w,
             img.height,
             screen_w,
             screen_h,
@@ -789,6 +794,12 @@ class VARIABLES:
     last_disk_check = 0.0
     # Last replay_buffer_start() call, so reconcile_buffer waits it out.
     buffer_start_at = 0.0
+    # The restart's own start would undo a stop made mid-restart, so the poll re-applies once it settles.
+    capture_apply_deferred = False
+    # The frontend start is queued, so a restart's STARTED event lands after buffer_restart_depth is back to 0.
+    restart_start_pending = False
+    restart_stop_pending = False
+    restart_loop_s = 0
 
 
 class PN:
@@ -1005,9 +1016,10 @@ def play_sound_with_gain(path: str, db_offset: float):
         play_sound(path)
         return
     # SND_ASYNC returns immediately, so delete only after playback would have finished.
-    clip_seconds = params.nframes / params.framerate if params.framerate else 10
     Thread(
-        target=_delete_after_delay, args=(tmp_path, clip_seconds + 2), daemon=True
+        target=_delete_after_delay,
+        args=(tmp_path, (params.nframes / params.framerate if params.framerate else 10) + 2),
+        daemon=True,
     ).start()
 
 
@@ -1038,8 +1050,7 @@ def get_sound_path(toast_key: str) -> str:
 def play_notification_sound(toast_key: str):
     if not VARIABLES.script_settings:
         return
-    db_offset = _setting_double(PN.VOLUME_OFFSET_DB)
-    play_sound_with_gain(get_sound_path(toast_key), db_offset)
+    play_sound_with_gain(get_sound_path(toast_key), _setting_double(PN.VOLUME_OFFSET_DB))
 
 
 def get_pythonw_path() -> str:
@@ -1070,9 +1081,11 @@ def show_popup(toast_key: str, kind: str, text_override: str = "", hold: float =
         "text_override": text_override,
     }
     # Strip OBS's PYTHONHOME/PYTHONPATH (aimed at its embedded interpreter); inherited, they make the spawned pythonw.exe fail to find its own stdlib.
-    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONHOME", "PYTHONPATH")}
     try:
-        subprocess.Popen([pythonw, __file__, kind, toast_key, json.dumps(cfg)], env=env)
+        subprocess.Popen(
+            [pythonw, __file__, kind, toast_key, json.dumps(cfg)],
+            env={k: v for k, v in os.environ.items() if k not in ("PYTHONHOME", "PYTHONPATH")},
+        )
     except Exception:
         _print(traceback.format_exc())
 
@@ -1177,8 +1190,8 @@ def get_alias(executable_path: Path) -> str | None:
     return None
 
 
-# -------------------- auto buffer (fullscreen detection + desktop capture link) --------------------
-# One bare exe name per browser covers every channel (stable/beta/dev/canary/nightly) - on Windows they differ by install folder, not binary name - via the bare-name match in is_exe_excepted. Screen-snip overlays span the primary monitor without being maximized.
+# -------------------- auto buffer (fullscreen detection) --------------------
+# One bare exe name per browser covers every channel - on Windows they differ by install folder, not binary name.
 DEFAULT_AUTO_BUFFER_EXCEPTIONS = (
     "chrome.exe",
     "msedge.exe",
@@ -1207,9 +1220,10 @@ def load_auto_buffer_exceptions(settings):
         if settings is not None
         else ""
     ) or DEFAULT_AUTO_BUFFER_EXCEPTIONS_TEXT
-    lines = (line.strip() for line in raw.splitlines())
     VARIABLES.auto_buffer_exceptions = {
-        line.lower() for line in lines if line and not line.startswith("#")
+        line.lower()
+        for line in (line.strip() for line in raw.splitlines())
+        if line and not line.startswith("#")
     }
 
 
@@ -1387,10 +1401,12 @@ def apply_capture_state():
     set_scene_source_visible(_setting_str(PN.GAME_SOURCE_NAME), target == "game")
     set_scene_source_visible(_setting_str(PN.DESKTOP_SOURCE_NAME), target == "display")
     if VARIABLES.buffer_restart_depth > 0:
-        return  # mid internal restart; it ends with the buffer running, next poll reconciles
+        VARIABLES.capture_apply_deferred = True
+        return
     running = obs.obs_frontend_replay_buffer_active()
     if target == "off" and running:
         _print("[capture] nothing to capture; stopping replay buffer")
+        VARIABLES.game_empty_since = 0.0
         obs.obs_frontend_replay_buffer_stop()
         notify("buffer_off", "buffer")
     elif target != "off" and not running:
@@ -1568,7 +1584,7 @@ def resolve_pending_hook():
         return
     if VARIABLES.display_override:
         _print("[hook] display override took over; abandoning the pending hook")
-        end_pending_hook()  # override took over during the wait; it re-detects when override ends
+        end_pending_hook()
         _clear_hook_retry()  # give the game a fresh retry budget when override ends
         apply_capture_state()
         return
@@ -1591,8 +1607,10 @@ def resolve_pending_hook():
             f"[hook] capture confirmed via {'OBS signal' if via_signal else 'source width'}"
         )
     end_pending_hook()
-    with suppress(Exception):
+    try:
         finish_game_hook(pid, hooked)
+    except Exception:
+        _print("[hook] error finishing the hook:\n" + traceback.format_exc())
 
 
 def _exe_label(pid: int) -> str:
@@ -1621,26 +1639,26 @@ def finish_game_hook(pid: int, hooked: bool):
         apply_capture_state()
         notify("game_on", "game")
         return
+    label = _exe_label(pid)
     attempt = VARIABLES.hook_retry_count + 1 if pid == VARIABLES.hook_retry_pid else 1
     VARIABLES.hook_retry_pid = pid
     VARIABLES.hook_retry_count = attempt
     if attempt < HOOK_MAX_ATTEMPTS:
         # Re-arm here, not via detect_new_game() - that's gated behind AUTO_GAME_CLIPPING and the manual hotkey path needs the retry too.
         _print(
-            f"[hook] no capture yet for {_exe_label(pid)} (try {attempt}/{HOOK_MAX_ATTEMPTS}); keeping the source up and retrying"
+            f"[hook] no capture yet for {label} (try {attempt}/{HOOK_MAX_ATTEMPTS}); keeping the source up and retrying"
         )
         notify_status(
             "game_connecting",
-            f"Still connecting {_exe_label(pid)} ({attempt}/{HOOK_MAX_ATTEMPTS})",
+            f"Still connecting {label} ({attempt}/{HOOK_MAX_ATTEMPTS})",
         )
         begin_game_hook(pid)
         return
     _clear_hook_retry()
-    _print(f"[hook] giving up on {_exe_label(pid)} after {HOOK_MAX_ATTEMPTS} tries")
+    _print(f"[hook] giving up on {label} after {HOOK_MAX_ATTEMPTS} tries")
     set_scene_source_visible(game_name, bool(VARIABLES.linked_games))
     # open may fail (protected process) - still record the pid so it isn't re-detected every poll.
     VARIABLES.handled_games[pid] = open_tracking_handle(pid)
-    label = _exe_label(pid)
     if not game_name:
         warn_once("No game capture source set; game clipping can't confirm a hook.")
     elif not source_exists(game_name):
@@ -1702,14 +1720,17 @@ def detect_new_game():
 
 
 def reconcile_buffer():
-    # Self-heal a buffer that should be running (game linked or override on) but was stopped outside our control - an encoder hiccup, OBS's own restart. Only ever starts it.
-    # The 8 s wait lets a pending start settle first.
+    # The 8 s wait lets a queued start (ours or a restart's) land before the buffer state is judged.
     if (
-        VARIABLES.buffer_restart_depth == 0
-        and capture_target() != "off"
-        and not obs.obs_frontend_replay_buffer_active()
-        and time.time() - VARIABLES.buffer_start_at >= 8.0
+        VARIABLES.buffer_restart_depth > 0
+        or time.time() - VARIABLES.buffer_start_at < 8.0
     ):
+        return
+    if VARIABLES.capture_apply_deferred:
+        VARIABLES.capture_apply_deferred = False
+        _print("[buffer] re-applying capture state deferred by a buffer restart")
+        apply_capture_state()
+    elif capture_target() != "off" and not obs.obs_frontend_replay_buffer_active():
         _print("[buffer] replay buffer was down while capture is active; restarting it")
         obs.obs_frontend_replay_buffer_start()
         VARIABLES.buffer_start_at = time.time()
@@ -1738,8 +1759,7 @@ def game_poll_callback():
 
 def setup_game_poll_timer():
     obs.timer_remove(game_poll_callback)
-    interval = _setting_int(PN.GAME_POLL_MS) or 3000
-    obs.timer_add(game_poll_callback, interval)
+    obs.timer_add(game_poll_callback, _setting_int(PN.GAME_POLL_MS) or 3000)
 
 
 # -------------------- sanity checks + disk warning --------------------
@@ -1790,7 +1810,6 @@ def _disk_check_worker(base: Path, limit_gb: int):
 
 
 def disk_check_tick():
-    # Resolve path + limit on the OBS thread; the walk (can be slow) runs off-thread.
     if time.time() - VARIABLES.last_disk_check < 60:
         return
     limit_gb = _setting_int(PN.CLIP_FOLDER_WARN_GB)
@@ -1883,7 +1902,7 @@ def disable_display_override(timed_out: bool = False):
     notify("desktop_off", "desktop", "Desktop capture timed out" if timed_out else "")
     if VARIABLES.linked_games:
         _print("[display] a game is still linked; game clipping resumes")
-        notify("game_on", "game")  # a game was still linked; game clipping resumes
+        notify("game_on", "game")
 
 
 def display_override_toggle():
@@ -1950,8 +1969,9 @@ def move_clip_file() -> Path:
     else:
         clip_name = gen_clip_base_name()
 
-    template = _setting_str(PN.FILENAME_TEMPLATE)
-    filename = gen_filename(clip_name, template) + Path(old_path).suffix
+    filename = gen_filename(clip_name, _setting_str(PN.FILENAME_TEMPLATE)) + Path(
+        old_path
+    ).suffix
     clip_name_folder = clip_name
     if _setting_bool(PN.REPLACE_SPACES):
         filename = filename.replace(" ", "_")
@@ -1995,10 +2015,9 @@ def notify(
 
 
 def notify_status(toast_key: str, text_override: str = "", hold: float = 0.0):
-    # Intermediate "still working" popups - silent, verbose-gated, and on their own popup slot so they never overwrite a real capture / warning toast.
-    with suppress(Exception):
-        if _setting_bool(PN.NOTIFY_VERBOSE):
-            notify(toast_key, "status", text_override, hold, silent=True)
+    # Own "status" popup slot so these never overwrite a real capture / warning toast.
+    if _setting_bool(PN.NOTIFY_VERBOSE):
+        notify(toast_key, "status", text_override, hold, silent=True)
 
 
 # -------------------- replay buffer save flow --------------------
@@ -2010,6 +2029,7 @@ def restart_replay_buffering():
     _print("[buffer] restarting replay buffering (periodic / post-save refresh)")
     try:
         replay_output = obs.obs_frontend_get_replay_buffer_output()
+        VARIABLES.restart_stop_pending = obs.obs_frontend_replay_buffer_active()
         obs.obs_frontend_replay_buffer_stop()
         if replay_output is not None:
             # Bounded so a wedged output can't pin buffer_restart_depth above zero forever.
@@ -2020,6 +2040,7 @@ def restart_replay_buffering():
             ):
                 time.sleep(0.1)
             obs.obs_output_release(replay_output)
+        VARIABLES.restart_start_pending = True
         obs.obs_frontend_replay_buffer_start()
         VARIABLES.buffer_start_at = time.time()
     finally:
@@ -2078,10 +2099,12 @@ def on_buffer_started_callback(event):
     obs.timer_remove(append_clip_exe_history)
     obs.timer_remove(restart_replay_buffering_callback)
     obs.timer_add(append_clip_exe_history, 1000)
-    if loop_time := _setting_int(PN.RESTART_BUFFER_LOOP):
-        obs.timer_add(restart_replay_buffering_callback, loop_time * 1000)
+    VARIABLES.restart_loop_s = _setting_int(PN.RESTART_BUFFER_LOOP)
+    if VARIABLES.restart_loop_s:
+        obs.timer_add(restart_replay_buffering_callback, VARIABLES.restart_loop_s * 1000)
+    from_restart, VARIABLES.restart_start_pending = VARIABLES.restart_start_pending, False
     # Not warn_once: a missing device means every clip from this buffer is silent or blank, so repeat it each time capture starts.
-    if VARIABLES.buffer_restart_depth == 0 and (msg := missing_device_message()):
+    if not from_restart and (msg := missing_device_message()):
         notify("warning", "warning", msg, hold=8.0)
 
 
@@ -2092,6 +2115,10 @@ def on_buffer_stopped_callback(event):
     obs.timer_remove(restart_replay_buffering_callback)
     if VARIABLES.clip_exe_history is not None:
         VARIABLES.clip_exe_history.clear()
+    from_restart, VARIABLES.restart_stop_pending = VARIABLES.restart_stop_pending, False
+    # A stop from outside the restart cycle (e.g. by hand mid-grace) ends the grace, or its stale clock would later kill a hand-started buffer.
+    if not from_restart:
+        VARIABLES.game_empty_since = 0.0
 
 
 # -------------------- reactive mic notifications --------------------
@@ -2167,9 +2194,11 @@ def toggle_mic_monitoring():
         )
         obs.obs_source_set_monitoring_type(
             source,
-            obs.OBS_MONITORING_TYPE_NONE
-            if currently_on
-            else obs.OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT,
+            (
+                obs.OBS_MONITORING_TYPE_NONE
+                if currently_on
+                else obs.OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT
+            ),
         )
     # No OBS signal fires for a monitoring-type change (unlike mute), so this notifies directly.
     notify("monitor_off" if currently_on else "monitor_on", "monitor")
@@ -2240,8 +2269,12 @@ def update_mic_source_callback(p, prop, data):
 
 
 def update_restart_loop_callback(p, prop, data):
-    obs.timer_remove(restart_replay_buffering_callback)
     loop_time = obs.obs_data_get_int(data, PN.RESTART_BUFFER_LOOP)
+    # Only a real value change reschedules; re-adding on a no-op call (properties rebuild) would push the pending restart back.
+    if loop_time == VARIABLES.restart_loop_s:
+        return True
+    VARIABLES.restart_loop_s = loop_time
+    obs.timer_remove(restart_replay_buffering_callback)
     if loop_time and obs.obs_frontend_replay_buffer_active():
         obs.timer_add(restart_replay_buffering_callback, loop_time * 1000)
     return True
