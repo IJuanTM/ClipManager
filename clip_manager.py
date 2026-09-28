@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     def script_path() -> str: ...
 
 
-SCRIPT_VERSION = "1.0.2"
+SCRIPT_VERSION = "1.0.3"
 
 
 # -------------------- toast popup (runs as a separate process) --------------------
@@ -613,6 +613,22 @@ if __name__ == "__main__":
     def prune_dead_entries(state: dict) -> dict:
         return {k: v for k, v in state.items() if user32.IsWindow(v["hwnd"])}
 
+    def claim_slide_out(kind: str, hwnd) -> bool:
+        # Re-checked under the lock so a same-kind toast can't repaint this window after it's committed to leaving.
+        mutex = acquire_state_lock()
+        try:
+            state = read_state()
+            entry = state.get(kind)
+            if not entry or entry.get("hwnd") != hwnd:
+                return True
+            if time.time() - entry["last_update"] < entry["hold"]:
+                return False
+            entry["closing"] = True
+            write_state(state)
+            return True
+        finally:
+            release_state_lock(mutex)
+
     def show_toast(kind: str, toast_key: str, cfg: dict):
         spec = TOASTS.get(toast_key)
         if not spec:
@@ -657,7 +673,7 @@ if __name__ == "__main__":
         try:
             state = prune_dead_entries(read_state())
             existing = state.get(kind)
-            if existing:
+            if existing and not existing.get("closing"):
                 # The owning process animates and times the window, so it needs this toast's x / width / hold, not the ones it was created with.
                 existing.update(
                     x=target_x, w=img.width, hold=hold_seconds, last_update=time.time()
@@ -717,7 +733,9 @@ if __name__ == "__main__":
             if (entry["x"], entry["w"]) != (x, w):
                 x, w = entry["x"], entry["w"]
                 move_window(hwnd, x, target_y, w, img.height, screen_w, screen_h)
-            if time.time() - entry["last_update"] >= entry["hold"]:
+            if time.time() - entry["last_update"] >= entry["hold"] and claim_slide_out(
+                kind, hwnd
+            ):
                 break
 
         animate_slide(
@@ -923,7 +941,7 @@ kernel32_win.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32_win.CloseHandle.restype = wintypes.BOOL
 kernel32_win.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 kernel32_win.WaitForSingleObject.restype = wintypes.DWORD
-kernel32_win.GetTickCount64.restype = ctypes.c_ulonglong
+kernel32_win.GetTickCount.restype = wintypes.DWORD
 kernel32_win.QueryFullProcessImageNameW.argtypes = [
     wintypes.HANDLE,
     wintypes.DWORD,
@@ -969,7 +987,8 @@ def get_time_since_last_input() -> int:
     info = LASTINPUTINFO()
     info.cbSize = ctypes.sizeof(LASTINPUTINFO)
     if user32_win.GetLastInputInfo(ctypes.byref(info)):
-        return (kernel32_win.GetTickCount64() - info.dwTime) // 1000
+        # 32-bit on both sides: dwTime wraps every 49.7 days, and the mask keeps the difference right across a wrap.
+        return ((kernel32_win.GetTickCount() - info.dwTime) & 0xFFFFFFFF) // 1000
     return 0
 
 
