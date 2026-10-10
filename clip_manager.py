@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     def script_path() -> str: ...
 
 
-SCRIPT_VERSION = "1.0.3"
+SCRIPT_VERSION = "1.1.0"
 
 
 # -------------------- toast popup (runs as a separate process) --------------------
@@ -154,6 +154,47 @@ FONT_CANDIDATES = [
     r"C:\Windows\Fonts\seguisb.ttf",
     r"C:\Windows\Fonts\arialbd.ttf",
 ]
+
+if __name__ == "__main__" and sys.argv[1:2] == ["--restart-obs"]:
+    _, _, obs_pid, obs_dir, obs_cmdline = sys.argv
+    k32 = ctypes.WinDLL("kernel32")
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.WaitForSingleObject.restype = wintypes.DWORD
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    SYNCHRONIZE, PROCESS_TERMINATE = 0x00100000, 0x0001
+    h = k32.OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, False, int(obs_pid))
+    if not h:
+        sys.exit(1)
+    k32.TerminateProcess(h, 1)
+    exited = k32.WaitForSingleObject(h, 30000) == 0
+    k32.CloseHandle(h)
+    if not exited:
+        sys.exit(1)
+    # Clears the killed run's unclean-shutdown marker, else the relaunch blocks on OBS's "launch in safe mode?" prompt.
+    for f in (Path(os.environ.get("APPDATA", "")) / "obs-studio" / ".sentinel").glob(
+        "run_*"
+    ):
+        with suppress(OSError):
+            f.unlink()
+    try:
+        subprocess.Popen(
+            obs_cmdline,
+            cwd=obs_dir,
+            creationflags=subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+    except OSError as e:
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            f"OBS was closed to recover a stuck replay buffer but couldn't be started again:\n{e}",
+            "Clip Manager",
+            0x30,  # MB_ICONWARNING
+        )
+        sys.exit(1)
+    sys.exit(0)
 
 if __name__ == "__main__":
     from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageFilter
@@ -803,6 +844,11 @@ class VARIABLES:
     game_hook_source = None
     display_override = False
     display_override_deadline = 0.0
+    # Games (pid -> exe) an auto desktop fallback stands in for; the auto-off waits for them to exit.
+    display_fallback_games: dict = {}
+    buffer_frames = -1
+    buffer_wedged_polls = 0
+    obs_restart_at = 0.0
     # Messages already surfaced this session, to avoid re-nagging.
     sanity_warned: set = set()
     # Latch so the folder-size warning fires once per threshold crossing.
@@ -865,6 +911,7 @@ class PN:
 
     RESTART_BUFFER = "restart_buffer"
     RESTART_BUFFER_LOOP = "restart_buffer_loop"
+    AUTO_RESTART_OBS = "auto_restart_obs"
 
     AUTO_GAME_CLIPPING = "auto_buffer_fullscreen"
     GAME_POLL_MS = "auto_buffer_poll_ms"
@@ -953,6 +1000,7 @@ kernel32_win.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
     ctypes.POINTER(wintypes.FILETIME)
 ] * 4
 kernel32_win.GetProcessTimes.restype = wintypes.BOOL
+kernel32_win.GetCommandLineW.restype = wintypes.LPWSTR
 
 
 def get_active_window_pid() -> int:
@@ -1104,18 +1152,19 @@ def show_popup(toast_key: str, kind: str, text_override: str = "", hold: float =
         "slide_out_ms": _setting_int(PN.POPUP_SLIDE_OUT_MS),
         "text_override": text_override,
     }
-    # Strip OBS's PYTHONHOME/PYTHONPATH (aimed at its embedded interpreter); inherited, they make the spawned pythonw.exe fail to find its own stdlib.
     try:
         subprocess.Popen(
-            [pythonw, __file__, kind, toast_key, json.dumps(cfg)],
-            env={
-                k: v
-                for k, v in os.environ.items()
-                if k not in ("PYTHONHOME", "PYTHONPATH")
-            },
+            [pythonw, __file__, kind, toast_key, json.dumps(cfg)], env=_child_env()
         )
     except Exception:
         _print(traceback.format_exc())
+
+
+def _child_env() -> dict:
+    # Strip OBS's PYTHONHOME/PYTHONPATH (aimed at its embedded interpreter); inherited, they make the spawned pythonw.exe fail to find its own stdlib.
+    return {
+        k: v for k, v in os.environ.items() if k not in ("PYTHONHOME", "PYTHONPATH")
+    }
 
 
 # -------------------- obs config helpers --------------------
@@ -1408,6 +1457,16 @@ def missing_device_message() -> str:
     return f"Device not found for {', '.join(missing)} - reselect it in OBS"
 
 
+def source_problem(label: str, name: str) -> str:
+    if not name:
+        return f"No {label.lower()} source set."
+    if not source_exists(name):
+        return f"{label} source '{name}' not found."
+    if not source_in_current_scene(name):
+        return f"{label} source '{name}' is not in the current scene."
+    return ""
+
+
 def warn_once(msg: str, toast_key: str = "warning"):
     if msg in VARIABLES.sanity_warned:
         return
@@ -1515,6 +1574,7 @@ def reap_dead_games():
                 f"[capture] dismissed game exited (pid {pid}); it can be auto-detected again"
             )
             _close_handles(VARIABLES.handled_games.pop(pid))
+            note_fallback_game_exit(pid)
     # Start the grace clock only on the transition to "no linked game", not for an idle session.
     if had_linked and not VARIABLES.linked_games and not VARIABLES.game_empty_since:
         VARIABLES.game_empty_since = time.time()
@@ -1522,6 +1582,27 @@ def reap_dead_games():
             f"[capture] no games left; stopping capture in {grace_seconds()}s unless one comes back"
         )
         notify_status("game_ending")
+
+
+def manual_override() -> bool:
+    return VARIABLES.display_override and not VARIABLES.display_fallback_games
+
+
+def fallback_game_running() -> bool:
+    return any(
+        pid in VARIABLES.handled_games or pid == VARIABLES.pending_hook_pid
+        for pid in VARIABLES.display_fallback_games
+    )
+
+
+def note_fallback_game_exit(pid: int):
+    if pid not in VARIABLES.display_fallback_games or fallback_game_running():
+        return
+    VARIABLES.display_override_deadline = time.time() + grace_seconds()
+    _print(
+        f"[display] fallback game exited; stopping desktop capture in {grace_seconds()}s"
+    )
+    notify_status("game_ending")
 
 
 def grace_seconds() -> int:
@@ -1610,7 +1691,7 @@ def resolve_pending_hook():
     pid = VARIABLES.pending_hook_pid
     if not pid:
         return
-    if VARIABLES.display_override:
+    if manual_override():
         _print("[hook] display override took over; abandoning the pending hook")
         end_pending_hook()
         _clear_hook_retry()  # give the game a fresh retry budget when override ends
@@ -1626,6 +1707,7 @@ def resolve_pending_hook():
             )
             end_pending_hook()
             _clear_hook_retry()
+            note_fallback_game_exit(pid)
             apply_capture_state()  # every other terminal hook path reconciles source visibility; this one must too
             return
         if time.time() < VARIABLES.pending_hook_deadline:
@@ -1649,10 +1731,10 @@ def _exe_label(pid: int) -> str:
 
 def finish_game_hook(pid: int, hooked: bool):
     game_name = _setting_str(PN.GAME_SOURCE_NAME)
+    exe = None
+    with suppress(Exception):
+        exe = get_executable_path(pid)
     if hooked:
-        exe = None
-        with suppress(Exception):
-            exe = get_executable_path(pid)
         # open may fail for a protected process - link anyway (OBS is capturing it) and note its start time so reap_dead_games can still tell when it exits.
         handle = open_tracking_handle(pid)
         info = {"handle": handle, "exe": exe}
@@ -1664,10 +1746,16 @@ def finish_game_hook(pid: int, hooked: bool):
         _print(
             f"[hook] linked {exe.stem if exe else pid}{' (no wait handle)' if not handle else ''}; capture is live ({len(VARIABLES.linked_games)} game(s) tracked)"
         )
+        if pid in VARIABLES.display_fallback_games or (
+            VARIABLES.display_fallback_games and not fallback_game_running()
+        ):
+            disable_display_override("game captured")
+            return
         apply_capture_state()
-        notify("game_on", "game")
+        if not VARIABLES.display_override:
+            notify("game_on", "game")
         return
-    label = _exe_label(pid)
+    label = exe.stem if exe else "game"
     attempt = VARIABLES.hook_retry_count + 1 if pid == VARIABLES.hook_retry_pid else 1
     VARIABLES.hook_retry_pid = pid
     VARIABLES.hook_retry_count = attempt
@@ -1687,12 +1775,8 @@ def finish_game_hook(pid: int, hooked: bool):
     set_scene_source_visible(game_name, bool(VARIABLES.linked_games))
     # open may fail (protected process) - still record the pid so it isn't re-detected every poll.
     VARIABLES.handled_games[pid] = open_tracking_handle(pid)
-    if not game_name:
-        warn_once("No game capture source set; game clipping can't confirm a hook.")
-    elif not source_exists(game_name):
-        warn_once(f"Game capture source '{game_name}' not found.")
-    elif not source_in_current_scene(game_name):
-        warn_once(f"Game capture source '{game_name}' is not in the current scene.")
+    if problem := source_problem("Game capture", game_name):
+        warn_once(problem)
     else:
         _print(
             f"[game] '{game_name}' hooked nothing for {label} - check its Mode is "
@@ -1703,7 +1787,7 @@ def finish_game_hook(pid: int, hooked: bool):
         _print(
             "[hook] 'Fall back to desktop on fail' is on; switching to display capture"
         )
-        enable_display_override(auto=True)
+        enable_display_override(fallback_pid=pid, fallback_exe=exe)
     else:
         _print(
             f"[hook] {label} left in the dismissed list; use the Game clipping hotkey to try again"
@@ -1765,6 +1849,98 @@ def reconcile_buffer():
         notify("buffer_on", "buffer")
 
 
+BUFFER_WEDGE_S = 30
+
+
+def check_buffer_health():
+    output = obs.obs_frontend_get_replay_buffer_output()
+    if not output:
+        return
+    try:
+        active = obs.obs_output_active(output)
+        frames = obs.obs_output_get_total_frames(output)
+        if not active:
+            VARIABLES.buffer_frames = -1
+            VARIABLES.buffer_wedged_polls = 0
+            return
+        # Frames freeze both when the encoder dies and when a stop can't land (it waits for a packet past the stop point), so this one check covers both.
+        stalled = frames == VARIABLES.buffer_frames
+        VARIABLES.buffer_frames = frames
+        if not stalled:
+            VARIABLES.buffer_wedged_polls = 0
+            return
+        VARIABLES.buffer_wedged_polls += 1
+        # Counted in polls, not wall time, so a sleep/resume gap can't read as a stall.
+        if (
+            VARIABLES.buffer_wedged_polls * (_setting_int(PN.GAME_POLL_MS) or 3000)
+            < BUFFER_WEDGE_S * 1000
+        ):
+            return
+        VARIABLES.buffer_wedged_polls = 0
+    finally:
+        obs.obs_output_release(output)
+    _print(
+        f"[buffer] replay buffer has encoded no video for {BUFFER_WEDGE_S}s; OBS's encoder stopped producing output "
+        "(usually a lost GPU device - look for 887A0005 in the OBS log)"
+    )
+    recover_wedged_buffer()
+
+
+OBS_RESTART_GIVEUP_S = 90
+
+
+def recover_wedged_buffer():
+    since = VARIABLES.obs_restart_at
+    if since and time.time() - since < OBS_RESTART_GIVEUP_S:
+        return
+    # A restart that was launched but left OBS running means the helper couldn't kill it, so fall back to telling the user.
+    if since or not restart_obs():
+        warn_once("Replay buffer is stuck - restart OBS")
+
+
+def restart_obs() -> bool:
+    if not _setting_bool(PN.AUTO_RESTART_OBS):
+        return False
+    if (
+        obs.obs_frontend_streaming_active()
+        or obs.obs_frontend_recording_active()
+        or obs.obs_frontend_virtualcam_active()
+    ):
+        _print(
+            "[buffer] not restarting OBS while streaming, recording or virtual camera is on"
+        )
+        return False
+    pythonw = get_pythonw_path()
+    if not pythonw:
+        return False
+    try:
+        args = [
+            pythonw,
+            __file__,
+            "--restart-obs",
+            str(os.getpid()),
+            str(get_executable_path(os.getpid()).parent),
+            kernel32_win.GetCommandLineW(),
+        ]
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        # Breakaway keeps the helper alive if OBS runs inside a kill-on-close job (Steam); a job that forbids breakaway rejects the flag.
+        try:
+            subprocess.Popen(
+                args,
+                env=_child_env(),
+                creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB,
+            )
+        except OSError:
+            subprocess.Popen(args, env=_child_env(), creationflags=flags)
+    except Exception:
+        _print("[buffer] couldn't launch the OBS restart:\n" + traceback.format_exc())
+        return False
+    VARIABLES.obs_restart_at = time.time()
+    _print("[buffer] restarting OBS to recover the replay buffer")
+    notify("warning", "warning", "Replay buffer stuck - restarting OBS", hold=4.0)
+    return True
+
+
 def game_poll_callback():
     if VARIABLES.disk_warn_msg:
         msg, VARIABLES.disk_warn_msg = VARIABLES.disk_warn_msg, ""
@@ -1777,10 +1953,11 @@ def game_poll_callback():
         resolve_pending_hook()
         if VARIABLES.display_override:
             check_display_override_timeout()
-        elif _setting_bool(PN.AUTO_GAME_CLIPPING):
+        if _setting_bool(PN.AUTO_GAME_CLIPPING) and not manual_override():
             detect_new_game()
         maybe_stop_after_grace()
         reconcile_buffer()
+        check_buffer_health()
     except Exception:
         _print("[poll] unhandled error in the capture poll:\n" + traceback.format_exc())
 
@@ -1800,12 +1977,8 @@ def run_sanity_checks():
     if auto and not game:
         warn_once("Auto game clipping is on but no game capture source is set.", "info")
     for label, name in (("Game capture", game), ("Display capture", desktop)):
-        if not name:
-            continue
-        if not source_exists(name):
-            warn_once(f"{label} source '{name}' not found.")
-        elif not source_in_current_scene(name):
-            warn_once(f"{label} source '{name}' is not in the current scene.")
+        if name and (problem := source_problem(label, name)):
+            warn_once(problem)
     if mic and not source_exists(mic):
         warn_once(f"Mic source '{mic}' not found.")
     if msg := missing_device_message():
@@ -1852,12 +2025,13 @@ def disk_check_tick():
 # -------------------- capture actions (hotkeys) --------------------
 def game_clipping_on():
     _print("[hotkey] Game clipping on")
-    if VARIABLES.display_override:
+    if manual_override():
         _print("[hotkey] ignored - display override is active; turn that off first")
         notify("info", "info", "Desktop capture is on - turn it off first")
         return
     fg = get_active_window_pid()
-    if fg in VARIABLES.handled_games:
+    # A fallback game stays in handled_games until its hook re-arms below, or an early return would leave the fallback tracking nothing.
+    if fg in VARIABLES.handled_games and fg not in VARIABLES.display_fallback_games:
         _print(f"[hotkey] clearing {_exe_label(fg)} from the dismissed list")
         _close_handles(VARIABLES.handled_games.pop(fg))
     if fg in VARIABLES.linked_games or VARIABLES.pending_hook_pid:
@@ -1884,7 +2058,7 @@ def game_clipping_off():
         VARIABLES.handled_games[pending] = open_tracking_handle(pending)
     fg = get_active_window_pid()
     targets = [fg] if fg in VARIABLES.linked_games else list(VARIABLES.linked_games)
-    if not targets and not pending:
+    if not targets and not pending and not VARIABLES.display_fallback_games:
         _print("[hotkey] nothing to stop")
         return
     for pid in targets:
@@ -1893,12 +2067,17 @@ def game_clipping_off():
         )
         VARIABLES.handled_games[pid] = VARIABLES.linked_games.pop(pid)["handle"]
     VARIABLES.game_empty_since = 0.0  # deliberate stop, no grace
+    if VARIABLES.display_fallback_games:
+        disable_display_override("game clipping off")
     apply_capture_state()
     notify("game_off", "game")
 
 
 def game_clipping_toggle():
-    if VARIABLES.linked_games or VARIABLES.pending_hook_pid:
+    # During a desktop fallback the toggle only ever retries the hook; desktop capture ends on a successful hook, the off hotkey, or the game exiting.
+    if VARIABLES.display_fallback_games:
+        game_clipping_on()
+    elif VARIABLES.linked_games or VARIABLES.pending_hook_pid:
         game_clipping_off()
     else:
         game_clipping_on()
@@ -1909,25 +2088,47 @@ def _reset_override_deadline():
     VARIABLES.display_override_deadline = time.time() + mins * 60 if mins > 0 else 0.0
 
 
-def enable_display_override(auto: bool = False):
+def enable_display_override(fallback_pid: int = 0, fallback_exe: Path | None = None):
     if VARIABLES.display_override:
-        _reset_override_deadline()
+        if not fallback_pid:
+            if VARIABLES.display_fallback_games:
+                VARIABLES.display_fallback_games = {}
+                _print("[display] fallback taken over manually; normal auto-off applies")
+            _reset_override_deadline()
+        elif VARIABLES.display_fallback_games:
+            VARIABLES.display_fallback_games[fallback_pid] = fallback_exe
+            _print(f"[display] fallback now also covers pid {fallback_pid}")
         return
     VARIABLES.display_override = True
+    if fallback_pid:
+        VARIABLES.display_fallback_games = {fallback_pid: fallback_exe}
     _reset_override_deadline()
-    _print(f"[display] override ON ({'auto - game hook failed' if auto else 'manual'})")
+    _print(
+        f"[display] override ON ({'auto - game hook failed' if fallback_pid else 'manual'})"
+    )
     apply_capture_state()
-    notify("desktop_on", "desktop", "Switched to desktop capture" if auto else "")
+    notify(
+        "desktop_on", "desktop", "Switched to desktop capture" if fallback_pid else ""
+    )
+    if problem := source_problem(
+        "Display capture", _setting_str(PN.DESKTOP_SOURCE_NAME)
+    ):
+        warn_once(problem)
 
 
-def disable_display_override(timed_out: bool = False):
+def disable_display_override(reason: str = "manual"):
     if not VARIABLES.display_override:
         return
     VARIABLES.display_override = False
     VARIABLES.display_override_deadline = 0.0
-    _print(f"[display] override OFF ({'timed out' if timed_out else 'manual'})")
+    VARIABLES.display_fallback_games = {}
+    _print(f"[display] override OFF ({reason})")
     apply_capture_state()
-    notify("desktop_off", "desktop", "Desktop capture timed out" if timed_out else "")
+    notify(
+        "desktop_off",
+        "desktop",
+        "Desktop capture timed out" if reason == "timed out" else "",
+    )
     if VARIABLES.linked_games:
         _print("[display] a game is still linked; game clipping resumes")
         notify("game_on", "game")
@@ -1941,9 +2142,13 @@ def display_override_toggle():
 
 
 def check_display_override_timeout():
+    fallback = bool(VARIABLES.display_fallback_games)
+    # Any pending hook holds a fallback open: it either links (ends the fallback) or fails into it, so stopping now would just bounce the buffer.
+    if fallback and (VARIABLES.pending_hook_pid or fallback_game_running()):
+        return
     d = VARIABLES.display_override_deadline
     if d and time.time() >= d:
-        disable_display_override(timed_out=True)
+        disable_display_override("game exited" if fallback else "timed out")
 
 
 # -------------------- clip naming and moving --------------------
@@ -1955,9 +2160,18 @@ def _foregrounded_linked_exe() -> Path | None:
     return info.get("exe")
 
 
+def _fallback_exe() -> Path | None:
+    games = VARIABLES.display_fallback_games
+    if not games:
+        return None
+    return games.get(get_active_window_pid()) or next(
+        (exe for exe in games.values() if exe), None
+    )
+
+
 def gen_clip_base_name() -> str:
     # Prefer the linked game's exe; else the most-recorded buffer-window process, not the one focused right now (alt-tab at save time would misname it).
-    exe_path = _foregrounded_linked_exe()
+    exe_path = _foregrounded_linked_exe() or _fallback_exe()
     if exe_path is None and VARIABLES.clip_exe_history:
         exe_path = Counter(VARIABLES.clip_exe_history).most_common(1)[0][0]
     if exe_path is None:
@@ -1992,7 +2206,7 @@ def move_clip_file() -> Path:
     old_path = get_last_replay_file_name()
     if not old_path:
         raise RuntimeError("Replay buffer reported no saved file.")
-    if VARIABLES.display_override and not VARIABLES.linked_games:
+    if manual_override() and not VARIABLES.linked_games:
         clip_name = _setting_str(PN.DISPLAY_CLIP_FOLDER) or "Desktop"
     else:
         clip_name = gen_clip_base_name()
@@ -2060,15 +2274,20 @@ def restart_replay_buffering():
         replay_output = obs.obs_frontend_get_replay_buffer_output()
         VARIABLES.restart_stop_pending = obs.obs_frontend_replay_buffer_active()
         obs.obs_frontend_replay_buffer_stop()
+        stopped = True
         if replay_output is not None:
             # Bounded so a wedged output can't pin buffer_restart_depth above zero forever.
             deadline = time.time() + 10
             while (
-                not obs.obs_output_can_begin_data_capture(replay_output, 0)
+                not (stopped := obs.obs_output_can_begin_data_capture(replay_output, 0))
                 and time.time() < deadline
             ):
                 time.sleep(0.1)
             obs.obs_output_release(replay_output)
+        if not stopped:
+            VARIABLES.restart_stop_pending = False
+            _print("[buffer] restart aborted - the replay buffer never finished stopping")
+            return
         VARIABLES.restart_start_pending = True
         obs.obs_frontend_replay_buffer_start()
         VARIABLES.buffer_start_at = time.time()
@@ -2111,7 +2330,7 @@ def on_buffer_save_callback(event):
         move_clip_file()
         if _setting_bool(PN.RESTART_BUFFER):
             Thread(target=restart_replay_buffering, daemon=True).start()
-        if VARIABLES.display_override:
+        if manual_override():
             _reset_override_deadline()
         notify_clip(True)
     except Exception:
@@ -2472,7 +2691,7 @@ def setup_capture_group(g):
     obs.obs_properties_add_text(
         g,
         "capture_info",
-        "Detects a fullscreen app on the primary monitor. Desktop auto-off 0 = never.",
+        "Detects a fullscreen app on the primary monitor. Desktop auto-off 0 = never; a fallback lasts until its game exits.",
         obs.OBS_TEXT_INFO,
     )
     obs.obs_properties_add_text(
@@ -2496,10 +2715,19 @@ def setup_replay_buffer_group(g):
     loop_prop = obs.obs_properties_add_int(
         g, PN.RESTART_BUFFER_LOOP, "Periodic restart (s, 0 = off)", 0, 7200, 10
     )
+    obs.obs_properties_add_bool(
+        g, PN.AUTO_RESTART_OBS, "Restart OBS if the buffer locks up"
+    )
     obs.obs_properties_add_text(
         g,
         "restart_info",
         "Periodic restart works around an OBS bug in long sessions.",
+        obs.OBS_TEXT_INFO,
+    )
+    obs.obs_properties_add_text(
+        g,
+        "lockup_info",
+        "Lock-up restart is skipped while streaming, recording or virtual camera is on.",
         obs.OBS_TEXT_INFO,
     )
     obs.obs_property_set_modified_callback(loop_prop, update_restart_loop_callback)
@@ -2560,6 +2788,7 @@ def script_defaults(s):
         )
     obs.obs_data_set_default_bool(s, PN.RESTART_BUFFER, False)
     obs.obs_data_set_default_int(s, PN.RESTART_BUFFER_LOOP, 3600)
+    obs.obs_data_set_default_bool(s, PN.AUTO_RESTART_OBS, True)
     obs.obs_data_set_default_bool(s, PN.AUTO_GAME_CLIPPING, True)
     obs.obs_data_set_default_int(s, PN.GAME_POLL_MS, 3000)
     obs.obs_data_set_default_int(s, PN.GAME_EXIT_GRACE_S, 30)
@@ -2633,7 +2862,7 @@ save clips - the naming and moving runs off OBS's save event, not a hotkey of ou
 <b>Game clipping</b> (on by default) starts the replay buffer and shows the game capture
 source when a fullscreen app is detected on the primary monitor, and stops when it exits.
 An exceptions list keeps browsers etc. from counting. If OBS can't hook the game it says
-so and can fall back to desktop capture.
+so and can fall back to desktop capture until the game exits.
 <br/><br/>
 <b>Display override</b> is a manual hotkey: shows the display capture source and buffer
 regardless of game detection, auto-off after a configurable time. Its clips go to their
@@ -2643,6 +2872,7 @@ Bind "Game clipping on/off/toggle", "Display override on/off/toggle", "Toggle mi
 and "Toggle mic monitoring" under Settings &gt; Hotkeys (search "Clip Manager").
 <br/><br/>
 Sound files and a volume offset (dB) are configurable per notification under Sounds.
+A locked-up replay buffer (lost GPU device) makes the script restart OBS.
 Source name fields are editable dropdowns. Popups require Pillow in OBS's configured
 Python: pythonw.exe -m pip install pillow
 </div>"""

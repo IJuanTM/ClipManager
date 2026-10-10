@@ -12,11 +12,12 @@ An OBS Studio script that sorts replay-buffer clips into per-game folders, names
 - Keeps the buffer running while any detected program is open; stops it a grace period after the last one exits
 - Exceptions list so fullscreen apps that aren't games (browsers, media players, the desktop) don't count
 - Display override: a hotkey mode that forces Display Capture and the buffer on, with its own auto-off timer and clip subfolder
-- Optional fall back to Display Capture when OBS can't hook a detected program
+- Optional fall back to Display Capture when OBS can't hook a detected program, kept on until that program exits
 - A toast popup and a sound per event, both configurable and individually overridable
 - Mic mute and monitoring toggles on their own hotkeys; mute stays in sync with OBS's own controls
 - Warns when the clips folder grows past a size limit
 - Periodic and/or post-save replay-buffer restart, to work around long-session OBS buffer bugs
+- Spots a locked-up replay buffer (usually OBS losing its GPU device) and restarts OBS to recover it
 - Logs every capture decision to the OBS Script Log
 
 ---
@@ -56,11 +57,17 @@ Every few seconds the script checks the foreground window. If it's fullscreen on
 - **Hooked**: starts the replay buffer and shows _Game clipping on_, usually a second or two after the program finishes loading.
 - **Not hooked**: a short first wait (~30 s), then one longer retry (~2 min). If it still hasn't hooked after that, it shows _Couldn't capture \<program\>_ and, with _Fall back to desktop on fail_ on, switches to Display override. That long retry exists because a program caught mid-load can take close to a minute before OBS is actually able to hook it. If the process exits while waiting, the script gives up immediately instead of sitting out the timeout.
 
+The desktop fallback stands in for game clipping: it has no auto-off while the program it replaced is running, and ends a grace period after that program exits, same as a linked game. Its clips go to that program's folder. If another detected program also fails to hook during it, the fallback covers both until both have exited. Detection keeps running during it and _Game clipping on_ retries the hook: if the program it covers hooks, game capture takes over. Another program that hooks gets linked, but desktop capture stays on until the covered program has exited, since that one still isn't capturable. _Game clipping off_ ends it, and _Display override on_ turns it into a normal override with the usual auto-off.
+
 The link is really a set of processes: the buffer keeps running while at least one detected program is open, and stops a grace period (default **30 s**) after the last one closes, so a program that quits and relaunches inside that window never drops the buffer. _Game clipping off_ drops the foreground program right away and won't auto-detect it again until it restarts. _Game clipping on_ just runs the same detect-and-hook sequence once, on demand.
 
 ### Display override
 
 A hotkey mode that hides the Game Capture source, shows Display Capture, and starts the buffer. It outranks game detection (detection is ignored while it's on) and turns itself off after a set time, default **60 min**, reset by every clip saved while it's active. Clips saved this way go to a fixed subfolder (default `Desktop`) rather than a per-program one, unless a game is still linked, in which case they still go to that game's folder.
+
+### Lock-up recovery
+
+If the replay buffer encodes no video for 30 s, or a stop hasn't finished after 30 s, OBS's encoder has stopped producing output. In practice that's OBS losing its GPU device (`887A0005` in the OBS log), which OBS doesn't recover from by itself and which leaves the buffer stuck in _stopping_. Not even a force-stop gets out of that, so the script kills OBS and starts it again with the same command line, skipping the "didn't shut down properly" prompt. That restart is skipped (a warning is shown instead) while streaming, recording or using the virtual camera, or with _Restart OBS if the buffer locks up_ off.
 
 ### Clip naming
 
@@ -68,7 +75,7 @@ A hotkey mode that hides the Game Capture source, shows Display Capture, and sta
 <Clips folder>/<Name>/<filename template>.<ext>
 ```
 
-`<Name>` is the linked program's executable name, or an alias set for that path. With nothing linked, it falls back to whichever window process was seen most often across the buffer's length, not whatever happens to be focused at save time. Display-override clips use the desktop subfolder name unless a game is still linked.
+`<Name>` is the linked program's executable name, or an alias set for that path. With nothing linked, it falls back to whichever window process was seen most often across the buffer's length, not whatever happens to be focused at save time. Display-override clips use the desktop subfolder name unless a game is still linked; desktop-fallback clips use the program they stand in for.
 
 ### The Script Log
 
@@ -112,7 +119,7 @@ Bound in **Settings → Hotkeys** (search _"Clip Manager"_).
 | Action                  | What it does                                                                     |
 |-------------------------|----------------------------------------------------------------------------------|
 | Game clipping on        | Detect and hook the current fullscreen program now                               |
-| Game clipping off       | Drop the foreground program (or all linked ones); no re-detect until it restarts |
+| Game clipping off       | Drop the foreground program (or all linked ones) and any desktop fallback; no re-detect until it restarts |
 | Game clipping toggle    | On or off, depending on current state                                            |
 | Display override on     | Switch to Display Capture and buffer, ignoring game detection                    |
 | Display override off    | Leave Display override; hands back to game clipping if a program is still linked |
@@ -148,7 +155,7 @@ Grouped in the script's settings panel, behavioural groups first.
 | Detection interval           | 500–10000 ms                                                                                                                                   | 3000    |
 | Grace after game exits       | 0–600 s                                                                                                                                        | 30      |
 | Fall back to desktop on fail | On / Off                                                                                                                                       | On      |
-| Desktop auto-off             | 0–1440 min (0 = never)                                                                                                                         | 60      |
+| Desktop auto-off             | 0–1440 min (0 = never); a fallback instead lasts until its program exits                                                                       | 60      |
 | Exceptions                   | exe name or folder path, one per line — pre-filled with browsers, media players, the Windows shell, the lock screen, and the screen-snip tools |         |
 
 ### Clip files
@@ -168,6 +175,7 @@ Grouped in the script's settings panel, behavioural groups first.
 |--------------------------|--------------------|---------|
 | Restart after every save | On / Off           | Off     |
 | Periodic restart         | 0–7200 s (0 = off) | 3600    |
+| Restart OBS if the buffer locks up | On / Off | On |
 
 ### Notifications
 
