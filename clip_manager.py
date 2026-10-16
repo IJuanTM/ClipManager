@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     def script_path() -> str: ...
 
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.1"
 
 
 # -------------------- toast popup (runs as a separate process) --------------------
@@ -689,8 +689,7 @@ if __name__ == "__main__":
 
         screen_w = user32.GetSystemMetrics(0)
         screen_h = user32.GetSystemMetrics(1)
-        base_wnd_h = cfg.get("height_override") or screen_h / 12
-        wnd_h = round_px(base_wnd_h * scale)
+        wnd_h = round_px((cfg.get("height_override") or screen_h / 12) * scale)
 
         img, shadow_margin, rect_h, wnd_w = render_toast(spec, wnd_h)
         margin = cfg.get("edge_margin")
@@ -767,7 +766,12 @@ if __name__ == "__main__":
         x, w = target_x, img.width
         while True:
             time.sleep(STATE_POLL_SECONDS)
-            entry = read_state().get(kind)
+            # Python opens files without FILE_SHARE_DELETE, so an unlocked read here makes a writer's os.replace fail.
+            mutex = acquire_state_lock()
+            try:
+                entry = read_state().get(kind)
+            finally:
+                release_state_lock(mutex)
             # A missing/changed entry means the state file was lost or reassigned; still tear down the window this process owns.
             if not entry or entry.get("hwnd") != hwnd:
                 break
@@ -1188,12 +1192,11 @@ def get_obs_config(
 
     if not section or not param:
         return cfg
-    fn = {
+    return {
         str: obs.config_get_string,
         int: obs.config_get_int,
         bool: obs.config_get_bool,
-    }[value_type]
-    return fn(cfg, section, param)
+    }[value_type](cfg, section, param)
 
 
 def get_base_path(settings=None) -> Path:
@@ -1292,14 +1295,16 @@ DEFAULT_AUTO_BUFFER_EXCEPTIONS_TEXT = "\n".join(DEFAULT_AUTO_BUFFER_EXCEPTIONS)
 
 def load_auto_buffer_exceptions(settings):
     # Plain multiline string, never an obs_data_array: OBS AV'd rendering the old editable-list's default array on every script reload (frontend-tools RefreshProperties -> AddEditableList).
-    raw = (
-        obs.obs_data_get_string(settings, PN.AUTO_BUFFER_EXCEPTIONS)
-        if settings is not None
-        else ""
-    ) or DEFAULT_AUTO_BUFFER_EXCEPTIONS_TEXT
     VARIABLES.auto_buffer_exceptions = {
         line.lower()
-        for line in (line.strip() for line in raw.splitlines())
+        for line in (
+            line.strip()
+            for line in (
+                obs.obs_data_get_string(settings, PN.AUTO_BUFFER_EXCEPTIONS)
+                if settings is not None
+                else DEFAULT_AUTO_BUFFER_EXCEPTIONS_TEXT
+            ).splitlines()
+        )
         if line and not line.startswith("#")
     }
 
@@ -2093,7 +2098,9 @@ def enable_display_override(fallback_pid: int = 0, fallback_exe: Path | None = N
         if not fallback_pid:
             if VARIABLES.display_fallback_games:
                 VARIABLES.display_fallback_games = {}
-                _print("[display] fallback taken over manually; normal auto-off applies")
+                _print(
+                    "[display] fallback taken over manually; normal auto-off applies"
+                )
             _reset_override_deadline()
         elif VARIABLES.display_fallback_games:
             VARIABLES.display_fallback_games[fallback_pid] = fallback_exe
@@ -2286,7 +2293,9 @@ def restart_replay_buffering():
             obs.obs_output_release(replay_output)
         if not stopped:
             VARIABLES.restart_stop_pending = False
-            _print("[buffer] restart aborted - the replay buffer never finished stopping")
+            _print(
+                "[buffer] restart aborted - the replay buffer never finished stopping"
+            )
             return
         VARIABLES.restart_start_pending = True
         obs.obs_frontend_replay_buffer_start()
