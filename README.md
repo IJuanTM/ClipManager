@@ -12,6 +12,7 @@ An OBS Studio script that sorts replay-buffer clips into per-game folders, names
 - Keeps the buffer running while any detected program is open; stops it a grace period after the last one exits
 - Exceptions list so fullscreen apps that aren't games (browsers, media players, the desktop) don't count
 - Display override: a hotkey mode that forces Display Capture and the buffer on, with its own auto-off timer and clip subfolder
+- Capture by window for games whose anti-cheat refuses OBS's hook (like CS2 in Trusted Mode), using Window Capture with no injection
 - Optional fall back to Display Capture when OBS can't hook a detected program, kept on until that program exits
 - A toast popup and a sound per event, both configurable and individually overridable
 - Mic mute and monitoring toggles on their own hotkeys; mute stays in sync with OBS's own controls
@@ -56,6 +57,8 @@ Every few seconds the script checks the foreground window. If it's fullscreen on
 
 - **Hooked**: starts the replay buffer and shows _Game clipping on_, usually a second or two after the program finishes loading.
 - **Not hooked**: a short first wait (~30 s), then one longer retry (~2 min). If it still hasn't hooked after that, it shows _Couldn't capture \<program\>_ and, with _Fall back to desktop on fail_ on, switches to Display override. That long retry exists because a program caught mid-load can take close to a minute before OBS is actually able to hook it. If the process exits while waiting, the script gives up immediately instead of sitting out the timeout.
+
+Programs on the _Capture by window_ list skip the hook entirely, so OBS never tries to inject into them. The script points your Window Capture source at the program's window using Windows Graphics Capture, and hides Game Capture. If that hasn't started within 15 s (or no Window Capture source is set), it shows _Couldn't capture \<program\>_ and uses the same desktop fallback, without the long retry. This needs the game in borderless or windowed mode, and Windows draws a yellow border around the captured window on Windows 10. With several programs linked, the visible source follows whichever was last in the foreground.
 
 The desktop fallback stands in for game clipping: it has no auto-off while the program it replaced is running, and ends a grace period after that program exits, same as a linked game. Its clips go to that program's folder. If another detected program also fails to hook during it, the fallback covers both until both have exited. Detection keeps running during it and _Game clipping on_ retries the hook: if the program it covers hooks, game capture takes over. Another program that hooks gets linked, but desktop capture stays on until the covered program has exited, since that one still isn't capturable. _Game clipping off_ ends it, and _Display override on_ turns it into a normal override with the usual auto-off.
 
@@ -145,6 +148,7 @@ Grouped in the script's settings panel, behavioural groups first.
 |------------------------|-------------------------------------------------------------|
 | Game capture source    | Name of your Game Capture source                            |
 | Display capture source | Name of your Display Capture source                         |
+| Window capture source  | Name of your Window Capture source (script sets its target) |
 | Mic source             | Name of the mic audio source for the mute / monitor hotkeys |
 
 ### Capture
@@ -157,6 +161,7 @@ Grouped in the script's settings panel, behavioural groups first.
 | Fall back to desktop on fail | On / Off                                                                                                                                       | On      |
 | Desktop auto-off             | 0–1440 min (0 = never); a fallback instead lasts until its program exits                                                                       | 60      |
 | Exceptions                   | exe name or folder path, one per line — pre-filled with browsers, media players, the Windows shell, the lock screen, and the screen-snip tools |         |
+| Capture by window            | exe name or folder path, one per line: games that refuse OBS's hook, run borderless                                                            | cs2.exe |
 
 ### Clip files
 

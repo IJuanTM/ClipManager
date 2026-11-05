@@ -1,8 +1,11 @@
+.vscode/
+
 __pycache__/
 .mypy_cache/
 
 toast_state.json
 toast_state.*.tmp
+toast_errors.*
 clip_manager_gain_*.wav
 
 .claude

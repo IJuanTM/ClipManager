@@ -27,7 +27,8 @@ if TYPE_CHECKING:
     def script_path() -> str: ...
 
 
-SCRIPT_VERSION = "1.1.1"
+SCRIPT_VERSION = "1.2.0"
+TOAST_ERROR_FILE = "toast_errors.log"
 
 
 # -------------------- toast popup (runs as a separate process) --------------------
@@ -142,10 +143,12 @@ ICON_CONTENT_REF = 410  # measured content diameter shared across all the icon a
 SELF_CONTAINED_ICON_SCALE = 2.0
 GLYPH_ICON_SCALE = 1.1
 # Only the "on" (slash-free) variant's bbox is trustworthy for measuring an off-center glyph - the "off" variant's bbox is dominated by its symmetric diagonal slash regardless of where the glyph sits.
-ICON_Y_OFFSET_SRC_PX = {"display-capture-on": 12.5, "display-capture-off": 12.5}
+ICON_Y_OFFSET_SRC_PX = {
+    "display-capture-on": 12.5, "display-capture-off": 12.5}
 ICON_Y_NUDGE_PX = 1
 TOAST_HOLD_SECONDS = 2.0
-TOAST_MAX_SLOTS = 9  # must be >= the distinct toast kinds passed to notify()/show_popup(), one state slot each
+# must be >= the distinct toast kinds passed to notify()/show_popup(), one state slot each
+TOAST_MAX_SLOTS = 9
 STATE_POLL_SECONDS = 0.1
 TOAST_MUTEX_NAME = "Local\\ClipManagerToastStateMutex"
 
@@ -209,7 +212,7 @@ if __name__ == "__main__":
 
     def hex_to_rgb(h):
         h = h.lstrip("#")
-        return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))
+        return tuple(int(h[i: i + 2], 16) for i in (0, 2, 4))
 
     def load_font(size):
         for path in FONT_CANDIDATES:
@@ -219,7 +222,8 @@ if __name__ == "__main__":
 
     def thick_line(draw, points, width, fill):
         pts = list(points)
-        draw.line(pts, fill=fill, width=width, joint="curve" if len(pts) > 2 else None)
+        draw.line(pts, fill=fill, width=width,
+                  joint="curve" if len(pts) > 2 else None)
         r = width / 2
         for x, y in (pts[0], pts[-1]):
             draw.ellipse((x - r, y - r, x + r, y + r), fill=fill)
@@ -250,13 +254,14 @@ if __name__ == "__main__":
         text_x = divider_x + rect_h * 0.1875
         font_size = max(round_px(rect_h * (18 / 64)), 10)
 
-        S = lambda v: round_px(v * ss)
+        def S(v): return round_px(v * ss)
         font = load_font(S(font_size))
         tb = ImageDraw.Draw(Image.new("L", (1, 1))).textbbox(
             (0, 0), spec["text"], font=font
         )
         content_inset = rect_h * (0.5 - 18 / 64)
-        rect_w = round_px((text_x - pad) + (tb[2] - tb[0]) / ss + content_inset)
+        rect_w = round_px(
+            (text_x - pad) + (tb[2] - tb[0]) / ss + content_inset)
         wnd_w = rect_w + 2 * pad
 
         shadow_margin = round_px(wnd_h * 0.35)
@@ -278,7 +283,8 @@ if __name__ == "__main__":
             radius=S(corner_r),
             fill=(0, 0, 0, 140),
         )
-        base.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(S(shadow_blur))))
+        base.alpha_composite(shadow.filter(
+            ImageFilter.GaussianBlur(S(shadow_blur))))
 
         mask = Image.new("L", (S(rect_w), S(rect_h)), 0)
         ImageDraw.Draw(mask).rounded_rectangle(
@@ -302,7 +308,8 @@ if __name__ == "__main__":
         )
 
         draw = ImageDraw.Draw(base)
-        bcx, bcy = S(shadow_margin + pad + rect_h / 2), S(shadow_margin + wnd_h / 2)
+        bcx, bcy = S(shadow_margin + pad + rect_h /
+                     2), S(shadow_margin + wnd_h / 2)
         br = S(badge_r)
         if spec["self_contained"]:
             # Matches the glyph-only badge circle's diameter exactly, so every badge is the same size.
@@ -406,7 +413,8 @@ if __name__ == "__main__":
         ]
 
     class BITMAPINFO(ctypes.Structure):
-        _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
+        _fields_ = [("bmiHeader", BITMAPINFOHEADER),
+                    ("bmiColors", wintypes.DWORD * 3)]
 
     WS_EX_LAYERED = 0x00080000
     WS_EX_TOOLWINDOW = 0x00000080
@@ -499,10 +507,12 @@ if __name__ == "__main__":
         ctypes.c_int,
     ]
     gdi32.CreateRectRgn.restype = wintypes.HRGN
-    user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HRGN, wintypes.BOOL]
+    user32.SetWindowRgn.argtypes = [
+        wintypes.HWND, wintypes.HRGN, wintypes.BOOL]
     user32.SetWindowRgn.restype = ctypes.c_int
 
-    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.argtypes = [
+        wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
     kernel32.CreateMutexW.restype = wintypes.HANDLE
     kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel32.WaitForSingleObject.restype = wintypes.DWORD
@@ -614,7 +624,8 @@ if __name__ == "__main__":
             gdi32.DeleteObject(hrgn)
 
     def move_window(hwnd, x, y, w, h, screen_w, screen_h):
-        user32.SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE)
+        user32.SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0,
+                            0, SWP_NOSIZE | SWP_NOACTIVATE)
         clip_to_primary_monitor(hwnd, x, y, w, h, screen_w, screen_h)
 
     def ease_out_cubic(t):
@@ -673,7 +684,7 @@ if __name__ == "__main__":
     def show_toast(kind: str, toast_key: str, cfg: dict):
         spec = TOASTS.get(toast_key)
         if not spec:
-            return
+            raise ValueError(f"Unknown toast key: {toast_key}")
         if cfg.get("text_override"):
             spec = {**spec, "text": cfg["text_override"]}
 
@@ -693,7 +704,8 @@ if __name__ == "__main__":
 
         img, shadow_margin, rect_h, wnd_w = render_toast(spec, wnd_h)
         margin = cfg.get("edge_margin")
-        margin_x = margin_y = margin if margin is not None else round_px(screen_h / 80)
+        margin_x = margin_y = margin if margin is not None else round_px(
+            screen_h / 80)
         # Visible gap is (stack_step - rect_h), since rect_h already excludes the pill's own internal padding.
         desired_gap = cfg.get("stack_gap")
         if desired_gap is None:
@@ -728,23 +740,27 @@ if __name__ == "__main__":
                 )
                 stack_offset = slot * stack_step
                 if vpos == "top":
-                    target_y = round_px(margin_y - shadow_margin + stack_offset)
+                    target_y = round_px(
+                        margin_y - shadow_margin + stack_offset)
                 else:
                     target_y = round_px(
                         screen_h - wnd_h - margin_y - shadow_margin - stack_offset
                     )
                 hwnd = create_layered_window(img, start_x, target_y)
-                if hwnd:
-                    state[kind] = {
-                        "hwnd": hwnd,
-                        "x": target_x,
-                        "y": target_y,
-                        "w": img.width,
-                        "hold": hold_seconds,
-                        "slot": slot,
-                        "last_update": time.time(),
-                    }
-                    write_state(state)
+                if not hwnd:
+                    raise RuntimeError(
+                        f"CreateWindowExW failed (error {ctypes.GetLastError()})"
+                    )
+                state[kind] = {
+                    "hwnd": hwnd,
+                    "x": target_x,
+                    "y": target_y,
+                    "w": img.width,
+                    "hold": hold_seconds,
+                    "slot": slot,
+                    "last_update": time.time(),
+                }
+                write_state(state)
         finally:
             release_state_lock(mutex)
 
@@ -777,7 +793,8 @@ if __name__ == "__main__":
                 break
             if (entry["x"], entry["w"]) != (x, w):
                 x, w = entry["x"], entry["w"]
-                move_window(hwnd, x, target_y, w, img.height, screen_w, screen_h)
+                move_window(hwnd, x, target_y, w,
+                            img.height, screen_w, screen_h)
             if time.time() - entry["last_update"] >= entry["hold"] and claim_slide_out(
                 kind, hwnd
             ):
@@ -806,7 +823,16 @@ if __name__ == "__main__":
             release_state_lock(mutex)
 
     if len(sys.argv) > 3:
-        show_toast(sys.argv[1], sys.argv[2], json.loads(sys.argv[3]))
+        try:
+            show_toast(sys.argv[1], sys.argv[2], json.loads(sys.argv[3]))
+        except Exception:
+            # pythonw has no stderr, so the OBS side relays this file to the Script Log.
+            with suppress(OSError), Path(__file__).with_name(TOAST_ERROR_FILE).open(
+                "a", encoding="utf-8"
+            ) as error_file:
+                error_file.write(
+                    f"{datetime.now():%H:%M:%S} {sys.argv[1]}/{sys.argv[2]}\n{traceback.format_exc()}"
+                )
     sys.exit(0)
 
 
@@ -827,16 +853,20 @@ class VARIABLES:
     hotkey_ids: dict = {}
     aliases: dict[Path, str] = {}
     clip_exe_history: deque | None = None
-    mic_signal_source = None  # held source ref keeps its signal handler alive; released on reconnect/unload
+    # held source ref keeps its signal handler alive; released on reconnect/unload
+    mic_signal_source = None
     buffer_restart_depth = 0
     buffer_restart_lock = Lock()
     auto_buffer_exceptions: set = set()
+    window_capture_games: set = set()
     # The info dict holds an open SYNCHRONIZE handle so the PID can't be recycled while tracked.
     linked_games: dict = {}
     handled_games: dict = {}
     game_empty_since = 0.0
+    active_game_pid = 0
     pending_hook_pid = 0
     pending_hook_exe = ""
+    pending_window_spec = ""
     pending_hook_confirmed = False  # set off-thread by the game-capture "hooked" signal
     pending_hook_deadline = 0.0
     # One in-flight hook at a time, so its retry count is two scalars, not a pid map.
@@ -844,6 +874,7 @@ class VARIABLES:
     hook_retry_count = 0
     # Last [detect] line printed, so the per-poll scan doesn't spam the log.
     detect_note = ""
+    detect_rejected: tuple[int, str] | None = None
     # Held source ref for the "hooked" signal; released in end_pending_hook.
     game_hook_source = None
     display_override = False
@@ -860,6 +891,8 @@ class VARIABLES:
     # Set by the walk thread, surfaced (and cleared) on the OBS thread.
     disk_warn_msg = ""
     last_disk_check = 0.0
+    # Set by the renderer check thread, surfaced (and cleared) on the OBS thread.
+    popup_warn_msg = ""
     # Last replay_buffer_start() call, so reconcile_buffer waits it out.
     buffer_start_at = 0.0
     # The restart's own start would undo a stop made mid-restart, so the poll re-applies once it settles.
@@ -888,6 +921,7 @@ class PN:
 
     GAME_SOURCE_NAME = "game_source_name"
     DESKTOP_SOURCE_NAME = "desktop_source_name"
+    WINDOW_SOURCE_NAME = "window_source_name"
     MIC_SOURCE_NAME = "mic_source_name"
     DISPLAY_CLIP_FOLDER = "display_clip_folder"
     UNKNOWN_CLIP_FOLDER = "unknown_clip_folder"
@@ -921,6 +955,7 @@ class PN:
     GAME_POLL_MS = "auto_buffer_poll_ms"
     GAME_EXIT_GRACE_S = "auto_buffer_stop_delay_s"
     AUTO_BUFFER_EXCEPTIONS = "auto_buffer_exceptions"
+    WINDOW_CAPTURE_GAMES = "window_capture_games"
     AUTO_SWITCH_ON_HOOK_FAIL = "auto_switch_on_hook_fail"
     DISPLAY_OVERRIDE_AUTOOFF_MIN = "display_override_autooff_min"
 
@@ -967,13 +1002,18 @@ class WINDOWPLACEMENT(ctypes.Structure):
     ]
 
 
-user32_win.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32_win.GetWindowRect.argtypes = [
+    wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 user32_win.GetWindowRect.restype = wintypes.BOOL
 user32_win.GetSystemMetrics.argtypes = [ctypes.c_int]
 user32_win.GetSystemMetrics.restype = ctypes.c_int
 user32_win.GetForegroundWindow.restype = wintypes.HWND
-user32_win.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32_win.GetClassNameW.argtypes = [
+    wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32_win.GetClassNameW.restype = ctypes.c_int
+user32_win.GetWindowTextW.argtypes = [
+    wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32_win.GetWindowTextW.restype = ctypes.c_int
 user32_win.GetWindowThreadProcessId.argtypes = [
     wintypes.HWND,
     ctypes.POINTER(wintypes.DWORD),
@@ -986,7 +1026,8 @@ user32_win.GetWindowPlacement.argtypes = [
 user32_win.GetWindowPlacement.restype = wintypes.BOOL
 user32_win.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
 user32_win.GetLastInputInfo.restype = wintypes.BOOL
-kernel32_win.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32_win.OpenProcess.argtypes = [
+    wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32_win.OpenProcess.restype = wintypes.HANDLE
 kernel32_win.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32_win.CloseHandle.restype = wintypes.BOOL
@@ -1022,13 +1063,15 @@ def get_window_class(hwnd) -> str:
 
 def get_executable_path(pid: int) -> Path:
     # QueryFullProcessImageNameW + PROCESS_QUERY_LIMITED_INFORMATION resolves elevated / protected processes that GetModuleFileNameEx + VM_READ cannot.
-    handle = kernel32_win.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    handle = kernel32_win.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         raise OSError(f"Process {pid} does not exist.")
     # 32767, not MAX_PATH (260) - deeply nested install paths are common.
     buf = ctypes.create_unicode_buffer(32767)
     size = wintypes.DWORD(32767)
-    ok = kernel32_win.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+    ok = kernel32_win.QueryFullProcessImageNameW(
+        handle, 0, buf, ctypes.byref(size))
     kernel32_win.CloseHandle(handle)
     if not ok:
         raise RuntimeError(f"Cannot get executable path for process {pid}.")
@@ -1057,12 +1100,17 @@ def process_exited(handle: int) -> bool:
 
 def play_sound(path: str):
     if path:
-        with suppress(Exception):
+        try:
             winsound.PlaySound(path, winsound.SND_ASYNC)
+        except Exception:
+            _print(f"[sound] couldn't play {path}:\n" + traceback.format_exc())
 
 
 def play_sound_with_gain(path: str, db_offset: float):
-    if not path or not os.path.exists(path):
+    if not path:
+        return
+    if not os.path.exists(path):
+        warn_once(f"Sound file missing: {Path(path).name}")
         return
     if abs(db_offset) < 0.01:
         play_sound(path)
@@ -1074,7 +1122,8 @@ def play_sound_with_gain(path: str, db_offset: float):
         with wave.open(path, "rb") as wf:
             params = wf.getparams()
             frames = wf.readframes(wf.getnframes())
-        adjusted = audioop.mul(frames, params.sampwidth, 10 ** (db_offset / 20))
+        adjusted = audioop.mul(frames, params.sampwidth,
+                               10 ** (db_offset / 20))
         with wave.open(tmp_path, "wb") as wf_out:
             wf_out.setparams(params)
             wf_out.writeframes(adjusted)
@@ -1113,11 +1162,13 @@ def default_sound_path(toast_key: str) -> Path:
 
 def get_sound_path(toast_key: str) -> str:
     s = VARIABLES.script_settings
-    custom = obs.obs_data_get_string(s, sound_setting_name(toast_key)) if s else ""
+    custom = obs.obs_data_get_string(
+        s, sound_setting_name(toast_key)) if s else ""
     if custom:
         return custom
     return (
-        str(default_sound_path(toast_key)) if SOUND_DEFAULT_FILES.get(toast_key) else ""
+        str(default_sound_path(toast_key)
+            ) if SOUND_DEFAULT_FILES.get(toast_key) else ""
     )
 
 
@@ -1171,6 +1222,49 @@ def _child_env() -> dict:
     }
 
 
+def _popup_check_worker(pythonw: str):
+    # Runs off-thread: no obs.* calls. A failing popup process is otherwise invisible, since pythonw has no console and show_popup doesn't wait for it.
+    try:
+        result = subprocess.run(
+            [pythonw, "-c", "import PIL.Image"],
+            env=_child_env(),
+            capture_output=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return
+    except OSError:
+        VARIABLES.popup_warn_msg = f"Popups can't render: couldn't run {pythonw}"
+        return
+    if result.returncode != 0:
+        VARIABLES.popup_warn_msg = f'Popups can\'t render: Pillow failed to import. Run: "{pythonw}" -m pip install pillow'
+
+
+def check_popup_renderer():
+    if not (
+        _setting_bool(PN.NOTIFY_TOGGLE_POPUP) or _setting_bool(
+            PN.NOTIFY_CLIP_POPUP)
+    ):
+        return
+    if pythonw := get_pythonw_path():
+        Thread(target=_popup_check_worker, args=(
+            pythonw,), daemon=True).start()
+
+
+def relay_toast_errors():
+    path = get_script_dir() / TOAST_ERROR_FILE
+    if not path.exists():
+        return
+    reading = path.with_suffix(".reading")
+    try:
+        os.replace(path, reading)
+        text = reading.read_text(encoding="utf-8", errors="replace")
+        reading.unlink()
+    except OSError:
+        return  # a popup process is mid-write; the next poll retries
+    _print(f"[popup] a popup failed to render:\n{text.rstrip()}")
+
+
 # -------------------- obs config helpers --------------------
 OBS_VERSION_MAJOR = int(obs.obs_get_version_string().split(".")[0])
 
@@ -1203,7 +1297,8 @@ def get_base_path(settings=None) -> Path:
     settings = settings if settings is not None else VARIABLES.script_settings
     # script_defaults() runs before script_settings is populated, and obs_data_get_string(None, ...) crashes OBS outright.
     script_path_setting = (
-        obs.obs_data_get_string(settings, PN.BASE_PATH) if settings is not None else ""
+        obs.obs_data_get_string(
+            settings, PN.BASE_PATH) if settings is not None else ""
     )
     if script_path_setting:
         return Path(script_path_setting)
@@ -1249,12 +1344,17 @@ def load_aliases(script_settings_dict: dict):
     for entry in script_settings_dict.get(PN.ALIASES_LIST) or []:
         value = entry.get("value", "")
         if ">" not in value:
+            _print(f"[alias] skipped '{value}': expected 'path > name'")
             continue
         path_str, name = (part.strip() for part in value.split(">", 1))
         path_str = os.path.expandvars(path_str)
         if any(c in path_str for c in CONSTANTS.PATH_PROHIBITED_CHARS):
+            _print(
+                f"[alias] skipped '{value}': path has a prohibited character")
             continue
         if any(c in name for c in CONSTANTS.FILENAME_PROHIBITED_CHARS):
+            _print(
+                f"[alias] skipped '{value}': name has a prohibited character")
             continue
         new_aliases[Path(path_str)] = name
     VARIABLES.aliases = new_aliases
@@ -1291,45 +1391,57 @@ DEFAULT_AUTO_BUFFER_EXCEPTIONS = (
     "PotPlayerMini64.exe",
 )
 DEFAULT_AUTO_BUFFER_EXCEPTIONS_TEXT = "\n".join(DEFAULT_AUTO_BUFFER_EXCEPTIONS)
+DEFAULT_WINDOW_CAPTURE_GAMES_TEXT = "cs2.exe"
 
 
-def load_auto_buffer_exceptions(settings):
-    # Plain multiline string, never an obs_data_array: OBS AV'd rendering the old editable-list's default array on every script reload (frontend-tools RefreshProperties -> AddEditableList).
-    VARIABLES.auto_buffer_exceptions = {
+def _parse_exe_list(text: str) -> set:
+    return {
         line.lower()
-        for line in (
-            line.strip()
-            for line in (
-                obs.obs_data_get_string(settings, PN.AUTO_BUFFER_EXCEPTIONS)
-                if settings is not None
-                else DEFAULT_AUTO_BUFFER_EXCEPTIONS_TEXT
-            ).splitlines()
-        )
+        for line in (line.strip() for line in text.splitlines())
         if line and not line.startswith("#")
     }
 
 
-def is_exe_excepted(exe_path: Path) -> bool:
+def load_auto_buffer_exceptions(settings):
+    # Plain multiline string, never an obs_data_array: OBS AV'd rendering the old editable-list's default array on every script reload (frontend-tools RefreshProperties -> AddEditableList).
+    VARIABLES.auto_buffer_exceptions = _parse_exe_list(
+        obs.obs_data_get_string(settings, PN.AUTO_BUFFER_EXCEPTIONS)
+        if settings is not None
+        else DEFAULT_AUTO_BUFFER_EXCEPTIONS_TEXT
+    )
+
+
+def load_window_capture_games(settings):
+    VARIABLES.window_capture_games = _parse_exe_list(
+        obs.obs_data_get_string(settings, PN.WINDOW_CAPTURE_GAMES)
+    )
+
+
+def _exe_in_list(exe_path: Path, entries: set) -> bool:
     name = exe_path.name.lower()
     full = str(exe_path).lower().replace("/", "\\")
-    for entry in VARIABLES.auto_buffer_exceptions:
+    for entry in entries:
         e = entry.replace("/", "\\").rstrip("\\")
         if name == e or full == e or full.startswith(e + "\\"):
             return True
     return False
 
 
-def is_foreground_window_fullscreen() -> tuple[bool, int]:
+def is_exe_excepted(exe_path: Path) -> bool:
+    return _exe_in_list(exe_path, VARIABLES.auto_buffer_exceptions)
+
+
+def is_foreground_window_fullscreen() -> tuple[bool, int, str]:
     hwnd = user32_win.GetForegroundWindow()
     if not hwnd:
-        return False, 0
+        return False, 0, ""
     # The desktop shell window (Progman/WorkerW) spans the screen and isn't maximized, so it clears every check below and gets hooked as a fullscreen game.
     if get_window_class(hwnd) in ("Progman", "WorkerW"):
-        return False, 0
+        return False, 0, ""
     pid = wintypes.DWORD()
     user32_win.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     if pid.value == os.getpid():
-        return False, pid.value  # OBS itself
+        return False, pid.value, ""  # OBS itself
     # A maximized window's rect also covers the screen, so exclude it - only borderless/exclusive fullscreen should count.
     placement = WINDOWPLACEMENT()
     placement.length = ctypes.sizeof(WINDOWPLACEMENT)
@@ -1337,18 +1449,25 @@ def is_foreground_window_fullscreen() -> tuple[bool, int]:
         user32_win.GetWindowPlacement(hwnd, ctypes.byref(placement))
         and placement.showCmd == SW_SHOWMAXIMIZED
     ):
-        return False, pid.value
+        return False, pid.value, "its window is maximized, not fullscreen"
     rect = wintypes.RECT()
     if not user32_win.GetWindowRect(hwnd, ctypes.byref(rect)):
-        return False, pid.value
+        return False, pid.value, "its window size couldn't be read"
     # Primary monitor only, not wherever the window happens to be - GetSystemMetrics(0/1) is the primary monitor's size with its top-left always at the desktop origin (0,0).
-    fullscreen = (
+    screen_w = user32_win.GetSystemMetrics(0)
+    screen_h = user32_win.GetSystemMetrics(1)
+    if (
         rect.left <= 0
         and rect.top <= 0
-        and rect.right >= user32_win.GetSystemMetrics(0)
-        and rect.bottom >= user32_win.GetSystemMetrics(1)
+        and rect.right >= screen_w
+        and rect.bottom >= screen_h
+    ):
+        return True, pid.value, ""
+    return (
+        False,
+        pid.value,
+        f"its window ({rect.left},{rect.top})-({rect.right},{rect.bottom}) doesn't cover the {screen_w}x{screen_h} primary monitor",
     )
-    return fullscreen, pid.value
 
 
 # -------------------- capture state machine --------------------
@@ -1390,7 +1509,8 @@ def set_scene_source_visible(name: str, visible: bool):
     if not scene_source:
         return
     try:
-        item = obs.obs_scene_find_source(obs.obs_scene_from_source(scene_source), name)
+        item = obs.obs_scene_find_source(
+            obs.obs_scene_from_source(scene_source), name)
         if item and obs.obs_sceneitem_visible(item) != visible:
             obs.obs_sceneitem_set_visible(item, visible)
     finally:
@@ -1446,7 +1566,8 @@ def sources_missing_device() -> list:
     sources = obs.obs_enum_sources()
     try:
         for src in sources or []:
-            key = DEVICE_SETTING_KEYS.get(obs.obs_source_get_unversioned_id(src))
+            key = DEVICE_SETTING_KEYS.get(
+                obs.obs_source_get_unversioned_id(src))
             if key and _device_missing(src, key):
                 missing.append(obs.obs_source_get_name(src))
     finally:
@@ -1483,15 +1604,22 @@ def warn_once(msg: str, toast_key: str = "warning"):
 def capture_target() -> str:
     if VARIABLES.display_override:
         return "display"
-    if VARIABLES.linked_games:
-        return "game"
-    return "off"
+    if not VARIABLES.linked_games:
+        return "off"
+    active = VARIABLES.linked_games.get(VARIABLES.active_game_pid)
+    return "window" if active and active.get("window") else "game"
 
 
 def apply_capture_state():
     target = capture_target()
-    set_scene_source_visible(_setting_str(PN.GAME_SOURCE_NAME), target == "game")
-    set_scene_source_visible(_setting_str(PN.DESKTOP_SOURCE_NAME), target == "display")
+    set_scene_source_visible(_setting_str(
+        PN.GAME_SOURCE_NAME), target == "game")
+    set_scene_source_visible(
+        _setting_str(PN.WINDOW_SOURCE_NAME),
+        target == "window" or bool(VARIABLES.pending_window_spec),
+    )
+    set_scene_source_visible(_setting_str(
+        PN.DESKTOP_SOURCE_NAME), target == "display")
     if VARIABLES.buffer_restart_depth > 0:
         VARIABLES.capture_apply_deferred = True
         return
@@ -1524,6 +1652,7 @@ def clear_capture_tracking():
     _close_handles(*VARIABLES.handled_games.values())
     VARIABLES.linked_games = {}
     VARIABLES.handled_games = {}
+    VARIABLES.active_game_pid = 0
     _clear_hook_retry()
     VARIABLES.game_empty_since = 0.0
     end_pending_hook()
@@ -1571,7 +1700,8 @@ def reap_dead_games():
     had_linked = bool(VARIABLES.linked_games)
     for pid, info in list(VARIABLES.linked_games.items()):
         if _capture_target_gone(info["handle"], pid, info.get("start", 0)):
-            _print(f"[capture] linked game exited: {_linked_label(info)} (pid {pid})")
+            _print(
+                f"[capture] linked game exited: {_linked_label(info)} (pid {pid})")
             _close_handles(VARIABLES.linked_games.pop(pid)["handle"])
     for pid, handle in list(VARIABLES.handled_games.items()):
         if _capture_target_gone(handle, pid):
@@ -1619,7 +1749,8 @@ def maybe_stop_after_grace():
     if (
         VARIABLES.game_empty_since
         and not VARIABLES.linked_games
-        and not VARIABLES.pending_hook_pid  # a new game is hooking; don't stop then restart
+        # a new game is hooking; don't stop then restart
+        and not VARIABLES.pending_hook_pid
         and not VARIABLES.display_override
         and obs.obs_frontend_replay_buffer_active()
         and time.time() - VARIABLES.game_empty_since >= grace_seconds()
@@ -1634,11 +1765,17 @@ def maybe_stop_after_grace():
 HOOK_FIRST_TIMEOUT_S = 30
 HOOK_CONFIRM_TIMEOUT_S = 120
 HOOK_MAX_ATTEMPTS = 2
+# Unlike a hook, window capture doesn't wait for the game to finish loading, so failing to start within this is final.
+WINDOW_CAPTURE_TIMEOUT_S = 15
+# Values of OBS's window_capture_method and window_priority enums.
+WINDOW_METHOD_WGC = 2
+WINDOW_PRIORITY_EXE = 2
 
 
 def on_game_capture_hooked(calldata):
     # Fires on OBS's capture thread - touch a plain flag only; resolve_pending_hook (poll thread) acts on it.
-    exe = os.path.basename((obs.calldata_string(calldata, "executable") or "").lower())
+    exe = os.path.basename(
+        (obs.calldata_string(calldata, "executable") or "").lower())
     want = VARIABLES.pending_hook_exe
     if not want or not exe or exe == want:
         VARIABLES.pending_hook_confirmed = True
@@ -1650,7 +1787,8 @@ def connect_game_hook_signal():
     if not src:
         return
     obs.signal_handler_connect(
-        obs.obs_source_get_signal_handler(src), "hooked", on_game_capture_hooked
+        obs.obs_source_get_signal_handler(
+            src), "hooked", on_game_capture_hooked
     )
     # Keep the ref (don't release) so the handler outlives this call.
     VARIABLES.game_hook_source = src
@@ -1668,8 +1806,103 @@ def end_pending_hook():
     VARIABLES.game_hook_source = None
     VARIABLES.pending_hook_pid = 0
     VARIABLES.pending_hook_exe = ""
+    VARIABLES.pending_window_spec = ""
     VARIABLES.pending_hook_confirmed = False
     VARIABLES.pending_hook_deadline = 0.0
+
+
+def window_source_problem(name: str) -> str:
+    if problem := source_problem("Window capture", name):
+        return problem
+    with _source_ref(name) as src:
+        if obs.obs_source_get_unversioned_id(src) != "window_capture":
+            return f"'{name}' is not a Window Capture source."
+    return ""
+
+
+def _window_capture_spec(pid: int) -> str:
+    # OBS's "window" setting is title:class:exe with '#' and ':' escaped in each field.
+    hwnd = user32_win.GetForegroundWindow()
+    owner = wintypes.DWORD()
+    user32_win.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+    if owner.value != pid:
+        return ""
+    title = ctypes.create_unicode_buffer(512)
+    user32_win.GetWindowTextW(hwnd, title, 512)
+    with suppress(Exception):
+        fields = (title.value, get_window_class(
+            hwnd), get_executable_path(pid).name)
+        return ":".join(f.replace("#", "#22").replace(":", "#3A") for f in fields)
+    return ""
+
+
+def point_window_source(spec: str):
+    settings = obs.obs_data_create()
+    obs.obs_data_set_string(settings, "window", spec)
+    obs.obs_data_set_int(settings, "method", WINDOW_METHOD_WGC)
+    obs.obs_data_set_int(settings, "priority", WINDOW_PRIORITY_EXE)
+    with _source_ref(_setting_str(PN.WINDOW_SOURCE_NAME)) as src:
+        if src:
+            obs.obs_source_update(src, settings)
+    obs.obs_data_release(settings)
+
+
+def begin_window_capture(pid: int):
+    end_pending_hook()
+    label = _exe_label(pid)
+    name = _setting_str(PN.WINDOW_SOURCE_NAME)
+    spec = _window_capture_spec(pid)
+    problem = window_source_problem(name)
+    if problem or not spec:
+        if problem:
+            warn_once(problem)
+        _print(
+            f"[window] can't start window capture for {label}: {problem or 'its window is no longer in the foreground'}"
+        )
+        give_up_on_capture(pid, by_window=True)
+        return
+    VARIABLES.pending_hook_pid = pid
+    VARIABLES.pending_window_spec = spec
+    VARIABLES.pending_hook_deadline = time.time() + WINDOW_CAPTURE_TIMEOUT_S
+    with suppress(Exception):
+        VARIABLES.pending_hook_exe = get_executable_path(pid).name.lower()
+    point_window_source(spec)
+    # A visible Game Capture source would keep trying to inject into the game this path exists to leave alone.
+    set_scene_source_visible(
+        _setting_str(PN.GAME_SOURCE_NAME), capture_target() == "game"
+    )
+    set_scene_source_visible(name, True)
+    _print(
+        f"[window] {label} (pid {pid}) detected; capturing its window, no hook")
+    notify_status("game_detecting", f"{label} detected")
+
+
+def begin_game_capture(pid: int):
+    exe = None
+    with suppress(Exception):
+        exe = get_executable_path(pid)
+    if exe and _exe_in_list(exe, VARIABLES.window_capture_games):
+        begin_window_capture(pid)
+    else:
+        begin_game_hook(pid)
+
+
+def sync_active_game():
+    # Each capture source shows one game at a time, so the visible one follows whichever linked game was last in the foreground.
+    linked = VARIABLES.linked_games
+    fg = get_active_window_pid()
+    pid = fg if fg in linked else VARIABLES.active_game_pid
+    if pid not in linked:
+        pid = next(iter(linked), 0)
+    if pid == VARIABLES.active_game_pid:
+        return
+    VARIABLES.active_game_pid = pid
+    if not pid:
+        return
+    if spec := linked[pid].get("window"):
+        point_window_source(spec)
+    _print(f"[capture] now showing {_linked_label(linked[pid])} (pid {pid})")
+    apply_capture_state()
 
 
 def begin_game_hook(pid: int):
@@ -1689,7 +1922,8 @@ def begin_game_hook(pid: int):
         )
         notify_status("game_detecting", f"{label} detected")
     else:
-        _print(f"[hook] re-arming capture hook for {label} (pid {pid}); {wait}s window")
+        _print(
+            f"[hook] re-arming capture hook for {label} (pid {pid}); {wait}s window")
 
 
 def resolve_pending_hook():
@@ -1703,7 +1937,9 @@ def resolve_pending_hook():
         apply_capture_state()
         return
     via_signal = VARIABLES.pending_hook_confirmed
-    hooked = via_signal or source_width(_setting_str(PN.GAME_SOURCE_NAME)) > 0
+    window_spec = VARIABLES.pending_window_spec
+    source = PN.WINDOW_SOURCE_NAME if window_spec else PN.GAME_SOURCE_NAME
+    hooked = via_signal or source_width(_setting_str(source)) > 0
     if not hooked:
         # pending_hook_exe set means it was openable at detect, so a failed re-open now = it exited (crash / closed on a loading screen), not just protected.
         if VARIABLES.pending_hook_exe and not _pid_alive(pid):
@@ -1713,7 +1949,8 @@ def resolve_pending_hook():
             end_pending_hook()
             _clear_hook_retry()
             note_fallback_game_exit(pid)
-            apply_capture_state()  # every other terminal hook path reconciles source visibility; this one must too
+            # every other terminal hook path reconciles source visibility; this one must too
+            apply_capture_state()
             return
         if time.time() < VARIABLES.pending_hook_deadline:
             return
@@ -1723,7 +1960,7 @@ def resolve_pending_hook():
         )
     end_pending_hook()
     try:
-        finish_game_hook(pid, hooked)
+        finish_game_hook(pid, hooked, window_spec)
     except Exception:
         _print("[hook] error finishing the hook:\n" + traceback.format_exc())
 
@@ -1734,22 +1971,24 @@ def _exe_label(pid: int) -> str:
     return "game"
 
 
-def finish_game_hook(pid: int, hooked: bool):
-    game_name = _setting_str(PN.GAME_SOURCE_NAME)
+def finish_game_hook(pid: int, hooked: bool, window_spec: str = ""):
     exe = None
     with suppress(Exception):
         exe = get_executable_path(pid)
     if hooked:
         # open may fail for a protected process - link anyway (OBS is capturing it) and note its start time so reap_dead_games can still tell when it exits.
         handle = open_tracking_handle(pid)
-        info = {"handle": handle, "exe": exe}
+        info: dict = {"handle": handle, "exe": exe}
         if not handle:
             info["start"] = _process_start_ticks(pid)
+        if window_spec:
+            info["window"] = window_spec
         VARIABLES.linked_games[pid] = info
+        VARIABLES.active_game_pid = pid
         VARIABLES.game_empty_since = 0.0
         _clear_hook_retry()
         _print(
-            f"[hook] linked {exe.stem if exe else pid}{' (no wait handle)' if not handle else ''}; capture is live ({len(VARIABLES.linked_games)} game(s) tracked)"
+            f"[hook] linked {exe.stem if exe else pid}{' by window' if window_spec else ''}{' (no wait handle)' if not handle else ''}; capture is live ({len(VARIABLES.linked_games)} game(s) tracked)"
         )
         if pid in VARIABLES.display_fallback_games or (
             VARIABLES.display_fallback_games and not fallback_game_running()
@@ -1760,8 +1999,15 @@ def finish_game_hook(pid: int, hooked: bool):
         if not VARIABLES.display_override:
             notify("game_on", "game")
         return
+    if window_spec:
+        _print(
+            f"[window] no capture of {_exe_label(pid)} after {WINDOW_CAPTURE_TIMEOUT_S}s; it may be in exclusive fullscreen or minimized"
+        )
+        give_up_on_capture(pid, by_window=True)
+        return
     label = exe.stem if exe else "game"
-    attempt = VARIABLES.hook_retry_count + 1 if pid == VARIABLES.hook_retry_pid else 1
+    attempt = VARIABLES.hook_retry_count + \
+        1 if pid == VARIABLES.hook_retry_pid else 1
     VARIABLES.hook_retry_pid = pid
     VARIABLES.hook_retry_count = attempt
     if attempt < HOOK_MAX_ATTEMPTS:
@@ -1777,16 +2023,29 @@ def finish_game_hook(pid: int, hooked: bool):
         return
     _clear_hook_retry()
     _print(f"[hook] giving up on {label} after {HOOK_MAX_ATTEMPTS} tries")
-    set_scene_source_visible(game_name, bool(VARIABLES.linked_games))
+    give_up_on_capture(pid)
+
+
+def give_up_on_capture(pid: int, by_window: bool = False):
+    exe = None
+    with suppress(Exception):
+        exe = get_executable_path(pid)
+    label = exe.stem if exe else "game"
+    target = capture_target()
+    game_name = _setting_str(PN.GAME_SOURCE_NAME)
+    set_scene_source_visible(game_name, target == "game")
+    set_scene_source_visible(_setting_str(
+        PN.WINDOW_SOURCE_NAME), target == "window")
     # open may fail (protected process) - still record the pid so it isn't re-detected every poll.
     VARIABLES.handled_games[pid] = open_tracking_handle(pid)
-    if problem := source_problem("Game capture", game_name):
-        warn_once(problem)
-    else:
-        _print(
-            f"[game] '{game_name}' hooked nothing for {label} - check its Mode is "
-            "'Capture any fullscreen application'"
-        )
+    if not by_window:
+        if problem := source_problem("Game capture", game_name):
+            warn_once(problem)
+        else:
+            _print(
+                f"[game] OBS's hook never loaded into {label} - anti-cheat may be refusing it (add the game to 'Capture by window'), "
+                f"or check that '{game_name}' has Mode 'Capture any fullscreen application'"
+            )
     notify("game_failed", "game", f"Couldn't capture {label}")
     if _setting_bool(PN.AUTO_SWITCH_ON_HOOK_FAIL):
         _print(
@@ -1806,17 +2065,34 @@ def _detect_log(msg: str):
         _print(f"[detect] {msg}")
 
 
+def _log_detect_rejection(pid: int, reason: str):
+    # Keyed on pid + reason so the exe lookup and the line only happen when the foreground changes, not every poll.
+    if not reason or (pid, reason) == VARIABLES.detect_rejected:
+        return
+    VARIABLES.detect_rejected = (pid, reason)
+    label = f"pid {pid}"
+    with suppress(Exception):
+        exe_path = get_executable_path(pid)
+        if is_exe_excepted(exe_path):
+            return
+        label = exe_path.stem
+    _print(f"[detect] not treating {label} as a game: {reason}")
+
+
 def detect_new_game():
     if VARIABLES.pending_hook_pid:
         return
-    fullscreen, pid = is_foreground_window_fullscreen()
+    fullscreen, pid, reason = is_foreground_window_fullscreen()
     if not (fullscreen and pid):
         # Foreground isn't a fullscreen game; let the next real event log fresh.
         VARIABLES.detect_note = ""
+        _log_detect_rejection(pid, reason)
         return
+    VARIABLES.detect_rejected = None
     # Cheap membership checks first; only resolve the exe name (a syscall) once the pid is actually new.
     if pid in VARIABLES.linked_games:
-        _detect_log(f"{_linked_label(VARIABLES.linked_games[pid])} already linked")
+        _detect_log(
+            f"{_linked_label(VARIABLES.linked_games[pid])} already linked")
         return
     if pid in VARIABLES.handled_games:
         _detect_log(
@@ -1833,7 +2109,7 @@ def detect_new_game():
         return
     VARIABLES.detect_note = ""
     _print(f"[detect] fullscreen game in foreground: {label} (pid {pid})")
-    begin_game_hook(pid)
+    begin_game_capture(pid)
 
 
 def reconcile_buffer():
@@ -1848,7 +2124,8 @@ def reconcile_buffer():
         _print("[buffer] re-applying capture state deferred by a buffer restart")
         apply_capture_state()
     elif capture_target() != "off" and not obs.obs_frontend_replay_buffer_active():
-        _print("[buffer] replay buffer was down while capture is active; restarting it")
+        _print(
+            "[buffer] replay buffer was down while capture is active; restarting it")
         obs.obs_frontend_replay_buffer_start()
         VARIABLES.buffer_start_at = time.time()
         notify("buffer_on", "buffer")
@@ -1877,7 +2154,8 @@ def check_buffer_health():
         VARIABLES.buffer_wedged_polls += 1
         # Counted in polls, not wall time, so a sleep/resume gap can't read as a stall.
         if (
-            VARIABLES.buffer_wedged_polls * (_setting_int(PN.GAME_POLL_MS) or 3000)
+            VARIABLES.buffer_wedged_polls *
+                (_setting_int(PN.GAME_POLL_MS) or 3000)
             < BUFFER_WEDGE_S * 1000
         ):
             return
@@ -1938,7 +2216,8 @@ def restart_obs() -> bool:
         except OSError:
             subprocess.Popen(args, env=_child_env(), creationflags=flags)
     except Exception:
-        _print("[buffer] couldn't launch the OBS restart:\n" + traceback.format_exc())
+        _print("[buffer] couldn't launch the OBS restart:\n" +
+               traceback.format_exc())
         return False
     VARIABLES.obs_restart_at = time.time()
     _print("[buffer] restarting OBS to recover the replay buffer")
@@ -1947,15 +2226,20 @@ def restart_obs() -> bool:
 
 
 def game_poll_callback():
+    relay_toast_errors()
     if VARIABLES.disk_warn_msg:
         msg, VARIABLES.disk_warn_msg = VARIABLES.disk_warn_msg, ""
         _print(f"[warning] {msg}")
         notify("warning", "warning", msg, hold=8.0)
+    if VARIABLES.popup_warn_msg:
+        msg, VARIABLES.popup_warn_msg = VARIABLES.popup_warn_msg, ""
+        warn_once(msg)
     if VARIABLES.buffer_restart_depth > 0:
         return
     try:
         reap_dead_games()
         resolve_pending_hook()
+        sync_active_game()
         if VARIABLES.display_override:
             check_display_override_timeout()
         if _setting_bool(PN.AUTO_GAME_CLIPPING) and not manual_override():
@@ -1964,7 +2248,8 @@ def game_poll_callback():
         reconcile_buffer()
         check_buffer_health()
     except Exception:
-        _print("[poll] unhandled error in the capture poll:\n" + traceback.format_exc())
+        _print("[poll] unhandled error in the capture poll:\n" +
+               traceback.format_exc())
 
 
 def setup_game_poll_timer():
@@ -1980,10 +2265,14 @@ def run_sanity_checks():
     auto = _setting_bool(PN.AUTO_GAME_CLIPPING)
 
     if auto and not game:
-        warn_once("Auto game clipping is on but no game capture source is set.", "info")
+        warn_once(
+            "Auto game clipping is on but no game capture source is set.", "info")
     for label, name in (("Game capture", game), ("Display capture", desktop)):
         if name and (problem := source_problem(label, name)):
             warn_once(problem)
+    window = _setting_str(PN.WINDOW_SOURCE_NAME)
+    if window and (problem := window_source_problem(window)):
+        warn_once(problem)
     if mic and not source_exists(mic):
         warn_once(f"Mic source '{mic}' not found.")
     if msg := missing_device_message():
@@ -2042,16 +2331,19 @@ def game_clipping_on():
     if fg in VARIABLES.linked_games or VARIABLES.pending_hook_pid:
         _print("[hotkey] ignored - a game is already linked or hooking")
         return
-    fullscreen, pid = is_foreground_window_fullscreen()
+    fullscreen, pid, reason = is_foreground_window_fullscreen()
     if not (fullscreen and pid):
-        _print("[hotkey] no fullscreen game in the foreground")
+        _print(
+            f"[hotkey] no fullscreen game in the foreground{f': {reason}' if reason else ''}"
+        )
         notify("game_failed", "game", "No fullscreen game found")
         return
     if pid in VARIABLES.linked_games:
-        return  # already clipping it (foreground raced between the two GetForegroundWindow calls)
+        # already clipping it (foreground raced between the two GetForegroundWindow calls)
+        return
     if pid in VARIABLES.handled_games:
         _close_handles(VARIABLES.handled_games.pop(pid))
-    begin_game_hook(pid)
+    begin_game_capture(pid)
 
 
 def game_clipping_off():
@@ -2062,7 +2354,8 @@ def game_clipping_off():
         _clear_hook_retry()
         VARIABLES.handled_games[pending] = open_tracking_handle(pending)
     fg = get_active_window_pid()
-    targets = [fg] if fg in VARIABLES.linked_games else list(VARIABLES.linked_games)
+    targets = [fg] if fg in VARIABLES.linked_games else list(
+        VARIABLES.linked_games)
     if not targets and not pending and not VARIABLES.display_fallback_games:
         _print("[hotkey] nothing to stop")
         return
@@ -2070,7 +2363,9 @@ def game_clipping_off():
         _print(
             f"[hotkey] dismissing {_linked_label(VARIABLES.linked_games[pid])} (pid {pid})"
         )
-        VARIABLES.handled_games[pid] = VARIABLES.linked_games.pop(pid)["handle"]
+        VARIABLES.handled_games[pid] = VARIABLES.linked_games.pop(pid)[
+            "handle"]
+    sync_active_game()
     VARIABLES.game_empty_since = 0.0  # deliberate stop, no grace
     if VARIABLES.display_fallback_games:
         disable_display_override("game clipping off")
@@ -2178,16 +2473,24 @@ def _fallback_exe() -> Path | None:
 
 def gen_clip_base_name() -> str:
     # Prefer the linked game's exe; else the most-recorded buffer-window process, not the one focused right now (alt-tab at save time would misname it).
-    exe_path = _foregrounded_linked_exe() or _fallback_exe()
+    exe_path, source = _foregrounded_linked_exe(), "the linked game"
+    if exe_path is None:
+        exe_path, source = _fallback_exe(), "the game that failed to hook"
     if exe_path is None and VARIABLES.clip_exe_history:
         exe_path = Counter(VARIABLES.clip_exe_history).most_common(1)[0][0]
+        source = "the most-focused app during the buffer"
     if exe_path is None:
-        with suppress(Exception):
+        source = "the foreground app"
+        try:
             exe_path = get_executable_path(get_active_window_pid())
-    if exe_path is None:
-        # elevated / protected process we could never resolve
-        return _setting_str(PN.UNKNOWN_CLIP_FOLDER) or "Unknown"
-    return get_alias(exe_path) or exe_path.stem
+        except Exception as e:
+            # elevated / protected process we could never resolve
+            name = _setting_str(PN.UNKNOWN_CLIP_FOLDER) or "Unknown"
+            _print(f"[clip] named '{name}': no game or focus history, and {e}")
+            return name
+    name = get_alias(exe_path) or exe_path.stem
+    _print(f"[clip] named '{name}' after {source}")
+    return name
 
 
 def gen_filename(base_name: str, template: str) -> str:
@@ -2213,8 +2516,10 @@ def move_clip_file() -> Path:
     old_path = get_last_replay_file_name()
     if not old_path:
         raise RuntimeError("Replay buffer reported no saved file.")
+    _print(f"[clip] OBS saved {old_path}")
     if manual_override() and not VARIABLES.linked_games:
         clip_name = _setting_str(PN.DISPLAY_CLIP_FOLDER) or "Desktop"
+        _print(f"[clip] named '{clip_name}' after the display override folder")
     else:
         clip_name = gen_clip_base_name()
 
@@ -2242,12 +2547,14 @@ def move_clip_file() -> Path:
 
 # -------------------- notifications (never allowed to break the save/toggle flow) --------------------
 def notify_clip(success: bool):
-    with suppress(Exception):
-        toast_key = "replay_saved" if success else "replay_failed"
+    toast_key = "replay_saved" if success else "replay_failed"
+    try:
         if _setting_bool(PN.NOTIFY_CLIP_SOUND):
             play_notification_sound(toast_key)
         if _setting_bool(PN.NOTIFY_CLIP_POPUP):
             show_popup(toast_key, "replay")
+    except Exception:
+        _print(f"[notify] {toast_key} failed:\n" + traceback.format_exc())
 
 
 def notify(
@@ -2257,11 +2564,13 @@ def notify(
     hold: float = 0.0,
     silent: bool = False,
 ):
-    with suppress(Exception):
+    try:
         if not silent and _setting_bool(PN.NOTIFY_TOGGLE_SOUND):
             play_notification_sound(toast_key)
         if _setting_bool(PN.NOTIFY_TOGGLE_POPUP):
             show_popup(toast_key, kind, text_override, hold)
+    except Exception:
+        _print(f"[notify] {toast_key} failed:\n" + traceback.format_exc())
 
 
 def notify_status(toast_key: str, text_override: str = "", hold: float = 0.0):
@@ -2286,7 +2595,8 @@ def restart_replay_buffering():
             # Bounded so a wedged output can't pin buffer_restart_depth above zero forever.
             deadline = time.time() + 10
             while (
-                not (stopped := obs.obs_output_can_begin_data_capture(replay_output, 0))
+                not (stopped := obs.obs_output_can_begin_data_capture(
+                    replay_output, 0))
                 and time.time() < deadline
             ):
                 time.sleep(0.1)
@@ -2312,7 +2622,8 @@ def restart_replay_buffering_callback():
     idle = get_time_since_last_input()
     if idle < replay_length:
         obs.timer_add(
-            restart_replay_buffering_callback, max((replay_length - idle) * 1000, 2000)
+            restart_replay_buffering_callback, max(
+                (replay_length - idle) * 1000, 2000)
         )
         return
     Thread(target=restart_replay_buffering, daemon=True).start()
@@ -2343,7 +2654,7 @@ def on_buffer_save_callback(event):
             _reset_override_deadline()
         notify_clip(True)
     except Exception:
-        _print("Failed to move clip file.")
+        _print("Failed to move clip file; it stays where OBS saved it.")
         _print(traceback.format_exc())
         notify_clip(False)
 
@@ -2387,6 +2698,7 @@ def on_buffer_stopped_callback(event):
 # React to OBS's own mute signal so the toast fires regardless of trigger - our hotkey, OBS's native per-source hotkey, a Stream Deck, the Sources dock.
 def on_mic_mute_signal(calldata):
     muted = obs.calldata_bool(calldata, "muted")
+    _print(f"[mic] {'muted' if muted else 'unmuted'}")
     notify("mic_off" if muted else "mic_on", "mic")
 
 
@@ -2408,7 +2720,8 @@ def connect_mic_signal():
     source = obs.obs_get_source_by_name(name) if name else None
     if name and not source:
         # Don't tear down a working connection just because the source is briefly unresolvable.
-        _print(f"[mic] source '{name}' not found; keeping any existing connection")
+        _print(
+            f"[mic] source '{name}' not found; keeping any existing connection")
         return
     disconnect_mic_signal()
     if not source:
@@ -2441,6 +2754,7 @@ def _warn_mic_missing():
 
 
 def toggle_mic_mute():
+    _print("[hotkey] Mic mute toggle")
     with _source_ref(_setting_str(PN.MIC_SOURCE_NAME)) as source:
         if not source:
             return _warn_mic_missing()
@@ -2448,11 +2762,13 @@ def toggle_mic_mute():
 
 
 def toggle_mic_monitoring():
+    _print("[hotkey] Mic monitoring toggle")
     with _source_ref(_setting_str(PN.MIC_SOURCE_NAME)) as source:
         if not source:
             return _warn_mic_missing()
         currently_on = (
-            obs.obs_source_get_monitoring_type(source) != obs.OBS_MONITORING_TYPE_NONE
+            obs.obs_source_get_monitoring_type(
+                source) != obs.OBS_MONITORING_TYPE_NONE
         )
         obs.obs_source_set_monitoring_type(
             source,
@@ -2462,6 +2778,7 @@ def toggle_mic_monitoring():
                 else obs.OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT
             ),
         )
+    _print(f"[mic] monitoring {'off' if currently_on else 'on'}")
     # No OBS signal fires for a monitoring-type change (unlike mute), so this notifies directly.
     notify("monitor_off" if currently_on else "monitor_on", "monitor")
 
@@ -2472,8 +2789,10 @@ def _hk(action):
 
 def load_hotkeys():
     keys = (
-        (PN.HK_GAME_ON, "[Clip Manager] Game clipping on", _hk(game_clipping_on)),
-        (PN.HK_GAME_OFF, "[Clip Manager] Game clipping off", _hk(game_clipping_off)),
+        (PN.HK_GAME_ON, "[Clip Manager] Game clipping on",
+         _hk(game_clipping_on)),
+        (PN.HK_GAME_OFF, "[Clip Manager] Game clipping off",
+         _hk(game_clipping_off)),
         (
             PN.HK_GAME_TOGGLE,
             "[Clip Manager] Game clipping toggle",
@@ -2494,7 +2813,8 @@ def load_hotkeys():
             "[Clip Manager] Display override toggle",
             _hk(display_override_toggle),
         ),
-        (PN.HK_TOGGLE_MIC, "[Clip Manager] Toggle mic mute", _hk(toggle_mic_mute)),
+        (PN.HK_TOGGLE_MIC, "[Clip Manager] Toggle mic mute", _hk(
+            toggle_mic_mute)),
         (
             PN.HK_TOGGLE_MONITOR,
             "[Clip Manager] Toggle mic monitoring",
@@ -2517,6 +2837,11 @@ def update_aliases_callback(p, prop, data):
 
 def update_auto_buffer_exceptions_callback(p, prop, data):
     load_auto_buffer_exceptions(data)
+    return True
+
+
+def update_window_capture_games_callback(p, prop, data):
+    load_window_capture_games(data)
     return True
 
 
@@ -2585,6 +2910,7 @@ def setup_paths_group(g):
 def setup_sources_group(g):
     add_source_dropdown(g, PN.GAME_SOURCE_NAME, "Game capture source")
     add_source_dropdown(g, PN.DESKTOP_SOURCE_NAME, "Display capture source")
+    add_source_dropdown(g, PN.WINDOW_SOURCE_NAME, "Window capture source")
     mic_prop = add_source_dropdown(g, PN.MIC_SOURCE_NAME, "Mic source")
     obs.obs_properties_add_text(
         g,
@@ -2593,14 +2919,19 @@ def setup_sources_group(g):
         obs.OBS_TEXT_INFO,
     )
     # Mic signal binds to one named source, so a name change needs a reconnect.
-    obs.obs_property_set_modified_callback(mic_prop, update_mic_source_callback)
+    obs.obs_property_set_modified_callback(
+        mic_prop, update_mic_source_callback)
 
 
 def setup_notifications_group(g):
-    obs.obs_properties_add_bool(g, PN.NOTIFY_CLIP_SOUND, "Sound on clip saved / failed")
-    obs.obs_properties_add_bool(g, PN.NOTIFY_CLIP_POPUP, "Popup on clip saved / failed")
-    obs.obs_properties_add_bool(g, PN.NOTIFY_TOGGLE_SOUND, "Sound on capture toggles")
-    obs.obs_properties_add_bool(g, PN.NOTIFY_TOGGLE_POPUP, "Popup on capture toggles")
+    obs.obs_properties_add_bool(
+        g, PN.NOTIFY_CLIP_SOUND, "Sound on clip saved / failed")
+    obs.obs_properties_add_bool(
+        g, PN.NOTIFY_CLIP_POPUP, "Popup on clip saved / failed")
+    obs.obs_properties_add_bool(
+        g, PN.NOTIFY_TOGGLE_SOUND, "Sound on capture toggles")
+    obs.obs_properties_add_bool(
+        g, PN.NOTIFY_TOGGLE_POPUP, "Popup on capture toggles")
     obs.obs_properties_add_bool(
         g, PN.NOTIFY_VERBOSE, "Extra status popups (detecting / connecting / closing)"
     )
@@ -2637,17 +2968,22 @@ def setup_popup_group(g):
     obs.obs_property_list_add_string(hpos, "Center", "center")
     obs.obs_property_list_add_string(hpos, "Right", "right")
 
-    obs.obs_properties_add_float_slider(g, PN.POPUP_SCALE, "Scale", 0.5, 2.0, 0.05)
+    obs.obs_properties_add_float_slider(
+        g, PN.POPUP_SCALE, "Scale", 0.5, 2.0, 0.05)
     obs.obs_properties_add_int(
         g, PN.POPUP_HEIGHT_OVERRIDE, "Height (px, 0 = auto)", 0, 800, 5
     )
-    obs.obs_properties_add_int(g, PN.POPUP_EDGE_MARGIN, "Edge margin (px)", 0, 300, 1)
-    obs.obs_properties_add_int(g, PN.POPUP_STACK_GAP, "Stack gap (px)", 0, 200, 1)
+    obs.obs_properties_add_int(
+        g, PN.POPUP_EDGE_MARGIN, "Edge margin (px)", 0, 300, 1)
+    obs.obs_properties_add_int(
+        g, PN.POPUP_STACK_GAP, "Stack gap (px)", 0, 200, 1)
     obs.obs_properties_add_float_slider(
         g, PN.POPUP_HOLD_SECONDS, "Time on screen (s)", 0.5, 10.0, 0.1
     )
-    obs.obs_properties_add_int(g, PN.POPUP_SLIDE_IN_MS, "Slide-in (ms)", 0, 1000, 10)
-    obs.obs_properties_add_int(g, PN.POPUP_SLIDE_OUT_MS, "Slide-out (ms)", 0, 1000, 10)
+    obs.obs_properties_add_int(
+        g, PN.POPUP_SLIDE_IN_MS, "Slide-in (ms)", 0, 1000, 10)
+    obs.obs_properties_add_int(
+        g, PN.POPUP_SLIDE_OUT_MS, "Slide-out (ms)", 0, 1000, 10)
     obs.obs_properties_add_text(
         g,
         "popup_size_info",
@@ -2680,7 +3016,8 @@ def setup_aliases_group(g):
     aliases_list = obs.obs_properties_add_editable_list(
         g, PN.ALIASES_LIST, "Aliases", obs.OBS_EDITABLE_LIST_TYPE_STRINGS, None, None
     )
-    obs.obs_property_set_modified_callback(aliases_list, update_aliases_callback)
+    obs.obs_property_set_modified_callback(
+        aliases_list, update_aliases_callback)
 
 
 def setup_capture_group(g):
@@ -2713,14 +3050,28 @@ def setup_capture_group(g):
     exceptions_list = obs.obs_properties_add_text(
         g, PN.AUTO_BUFFER_EXCEPTIONS, "Exceptions", obs.OBS_TEXT_MULTILINE
     )
-    obs.obs_property_set_modified_callback(poll_prop, update_game_poll_timer_callback)
+    obs.obs_properties_add_text(
+        g,
+        "window_capture_info",
+        "Games that refuse OBS's hook (anti-cheat), run borderless: exe name or folder path, one per line.",
+        obs.OBS_TEXT_INFO,
+    )
+    window_games = obs.obs_properties_add_text(
+        g, PN.WINDOW_CAPTURE_GAMES, "Capture by window", obs.OBS_TEXT_MULTILINE
+    )
+    obs.obs_property_set_modified_callback(
+        window_games, update_window_capture_games_callback
+    )
+    obs.obs_property_set_modified_callback(
+        poll_prop, update_game_poll_timer_callback)
     obs.obs_property_set_modified_callback(
         exceptions_list, update_auto_buffer_exceptions_callback
     )
 
 
 def setup_replay_buffer_group(g):
-    obs.obs_properties_add_bool(g, PN.RESTART_BUFFER, "Restart after every save")
+    obs.obs_properties_add_bool(
+        g, PN.RESTART_BUFFER, "Restart after every save")
     loop_prop = obs.obs_properties_add_int(
         g, PN.RESTART_BUFFER_LOOP, "Periodic restart (s, 0 = off)", 0, 7200, 10
     )
@@ -2739,7 +3090,8 @@ def setup_replay_buffer_group(g):
         "Lock-up restart is skipped while streaming, recording or virtual camera is on.",
         obs.OBS_TEXT_INFO,
     )
-    obs.obs_property_set_modified_callback(loop_prop, update_restart_loop_callback)
+    obs.obs_property_set_modified_callback(
+        loop_prop, update_restart_loop_callback)
 
 
 def script_properties():
@@ -2793,7 +3145,8 @@ def script_defaults(s):
         if toast_key in STATUS_TOAST_KEYS:
             continue
         obs.obs_data_set_default_string(
-            s, sound_setting_name(toast_key), str(default_sound_path(toast_key))
+            s, sound_setting_name(toast_key), str(
+                default_sound_path(toast_key))
         )
     obs.obs_data_set_default_bool(s, PN.RESTART_BUFFER, False)
     obs.obs_data_set_default_int(s, PN.RESTART_BUFFER_LOOP, 3600)
@@ -2805,6 +3158,9 @@ def script_defaults(s):
     obs.obs_data_set_default_int(s, PN.DISPLAY_OVERRIDE_AUTOOFF_MIN, 60)
     obs.obs_data_set_default_string(
         s, PN.AUTO_BUFFER_EXCEPTIONS, DEFAULT_AUTO_BUFFER_EXCEPTIONS_TEXT
+    )
+    obs.obs_data_set_default_string(
+        s, PN.WINDOW_CAPTURE_GAMES, DEFAULT_WINDOW_CAPTURE_GAMES_TEXT
     )
 
 
@@ -2824,6 +3180,7 @@ def script_load(settings):
     _print(f"Clip Manager v{SCRIPT_VERSION} loading")
     load_aliases(json.loads(obs.obs_data_get_json(settings)))
     load_auto_buffer_exceptions(settings)
+    load_window_capture_games(settings)
 
     # Stale HWNDs here belong to a previous OBS session and Windows can recycle HWND values, so a leftover entry could make a fresh toast overwrite an unrelated window - clear it on every load.
     with suppress(Exception):
@@ -2839,9 +3196,11 @@ def script_load(settings):
     setup_game_poll_timer()
     obs.timer_add(disk_check_tick, 3_600_000)
     disk_check_tick()
+    check_popup_renderer()
 
     if obs.obs_frontend_replay_buffer_active():
-        on_buffer_started_callback(obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED)
+        on_buffer_started_callback(
+            obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED)
 
 
 def script_unload():
@@ -2870,8 +3229,9 @@ save clips - the naming and moving runs off OBS's save event, not a hotkey of ou
 <br/><br/>
 <b>Game clipping</b> (on by default) starts the replay buffer and shows the game capture
 source when a fullscreen app is detected on the primary monitor, and stops when it exits.
-An exceptions list keeps browsers etc. from counting. If OBS can't hook the game it says
-so and can fall back to desktop capture until the game exits.
+An exceptions list keeps browsers etc. from counting. Games that refuse OBS's hook can be
+listed under Capture by window to skip it. If a game still can't be captured it says so and
+can fall back to desktop capture until the game exits.
 <br/><br/>
 <b>Display override</b> is a manual hotkey: shows the display capture source and buffer
 regardless of game detection, auto-off after a configurable time. Its clips go to their
